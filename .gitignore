@@ -1,0 +1,63 @@
+# Python virtual environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+
+# OAuth credentials and authorized-user tokens (never commit these)
+credentials.json
+credentials*.json
+.env
+.env.*
+!.env.example
+frontend/.env.local
+frontend/.env.*
+!frontend/.env.example
+token*.json
+*.token.json
+token.json
+token_sheets.json
+token_sheets_write.json
+token_reply_sender.json
+token_internal_notifier.json
+*secret*
+*password*
+*apikey*
+*api_key*
+*.pem
+*.key
+.form_reply_replied_message_ids.json
+.form_processed_response_ids.json
+.case_results_write.lock
+.send_outbox/
+.send_outbox.lock
+.internal_notified_response_ids.json
+.gmail_activation.json
+.form_reply_replied_message_ids.tmp
+.form_processed_response_ids.tmp
+.internal_notified_response_ids.tmp
+.gmail_activation.tmp
+
+# Local logs and runtime artifacts
+logs/
+*.log
+*.tmp
+
+# Local data and runtime storage (preserve locally; do not commit user data)
+databases/*.sqlite3
+databases/*.sqlite3-*
+storage/*
+
+# Editors and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Frontend dependencies and Vite build output
+frontend/node_modules/
+frontend/dist/
