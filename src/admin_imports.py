@@ -15,6 +15,7 @@ from src.portal_db import mysql_options
 
 def _now(): return datetime.now(timezone.utc).replace(tzinfo=None)
 def _quote(name): return "`" + name.replace("`", "``") + "`"
+BATCH_SIZE = 500
 
 
 def _workbook_rows(content: bytes, source_sheet: str | None = None):
@@ -70,6 +71,100 @@ def _history(cursor, import_id, kind, filename, now):
     cursor.execute("INSERT INTO `durafit_portal`.`portal_import_history` (import_id,import_type,original_filename,started_at,status,created_at) VALUES (%s,%s,%s,%s,'running',%s)", (import_id.bytes,kind,filename[:255],now,now))
 
 
+def _chunks(values, size=BATCH_SIZE):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _existing_values(cursor, table: str, column: str, values: list[str]) -> set[str]:
+    """Fetch existing business keys in bounded queries without changing data."""
+    found: set[str] = set()
+    for chunk in _chunks(values):
+        placeholders = ", ".join(["%s"] * len(chunk))
+        cursor.execute(f"SELECT {_quote(column)} FROM {_quote(table)} WHERE {_quote(column)} IN ({placeholders})", chunk)
+        found.update(row[0] for row in cursor.fetchall())
+    return found
+
+
+def _import_crm_batch(cursor, conn, insert, order_index, rows, summary):
+    order_ids = list(dict.fromkeys(row[0][order_index] for row in rows if row[0][order_index] is not None))
+    existing = _existing_values(cursor, "crm_records", "Order ID", order_ids) if order_ids else set()
+    pending = []
+    for values, digest in rows:
+        order_id = values[order_index]
+        if order_id is not None and order_id in existing:
+            summary["skipped_rows"] += 1
+            continue
+        pending.append((values, digest))
+        # Match the prior row-by-row behavior for duplicate Order IDs later in
+        # the same workbook. NULL remains non-unique, as it was before.
+        if order_id is not None:
+            existing.add(order_id)
+    if not pending:
+        return
+    try:
+        conn.start_transaction()
+        cursor.executemany(insert, [values for values, _ in pending])
+        cursor.executemany("INSERT IGNORE INTO imported_record_hashes (record_hash) VALUES (%s)", [(digest,) for _, digest in pending])
+        conn.commit()
+        summary["inserted_rows"] += len(pending)
+    except mysql.connector.Error:
+        conn.rollback()
+        # Preserve independent-row failure behavior if a batch cannot be applied.
+        for values, digest in pending:
+            try:
+                conn.start_transaction()
+                cursor.execute("SELECT 1 FROM crm_records WHERE `Order ID`=%s LIMIT 1", (values[order_index],))
+                if cursor.fetchone():
+                    summary["skipped_rows"] += 1
+                    conn.rollback()
+                    continue
+                cursor.execute(insert, values)
+                cursor.execute("INSERT IGNORE INTO imported_record_hashes (record_hash) VALUES (%s)", (digest,))
+                conn.commit()
+                summary["inserted_rows"] += 1
+            except mysql.connector.Error:
+                conn.rollback()
+                summary["failed_rows"] += 1
+
+
+def _import_cases_batch(cursor, conn, insert, rows, summary):
+    digests = list(dict.fromkeys(digest for _, digest in rows))
+    existing = _existing_values(cursor, "imported_record_hashes", "record_hash", digests) if digests else set()
+    pending = []
+    for values, digest in rows:
+        if digest in existing:
+            summary["skipped_rows"] += 1
+            continue
+        pending.append((values, digest))
+        existing.add(digest)
+    if not pending:
+        return
+    try:
+        conn.start_transaction()
+        cursor.executemany("INSERT INTO imported_record_hashes (record_hash) VALUES (%s)", [(digest,) for _, digest in pending])
+        cursor.executemany(insert, [values for values, _ in pending])
+        conn.commit()
+        summary["inserted_rows"] += len(pending)
+    except mysql.connector.Error:
+        conn.rollback()
+        # A fallback keeps a bad row from failing unrelated rows in its batch.
+        for values, digest in pending:
+            try:
+                conn.start_transaction()
+                cursor.execute("INSERT IGNORE INTO imported_record_hashes (record_hash) VALUES (%s)", (digest,))
+                if cursor.rowcount == 0:
+                    summary["skipped_rows"] += 1
+                    conn.rollback()
+                    continue
+                cursor.execute(insert, values)
+                conn.commit()
+                summary["inserted_rows"] += 1
+            except mysql.connector.Error:
+                conn.rollback()
+                summary["failed_rows"] += 1
+
+
 def import_xlsx(kind: str, filename: str, content: bytes) -> dict:
     if kind not in {"crm", "cases"}: raise ValueError("Unknown import type")
     if not filename.lower().endswith(".xlsx"): raise ValueError("Only .xlsx files are accepted")
@@ -83,24 +178,20 @@ def import_xlsx(kind: str, filename: str, content: bytes) -> dict:
         headers = _table_layout(cursor, database, table, source_headers, kind == "crm")
         quoted = ", ".join(_quote(h) for h in headers); placeholders = ", ".join(["%s"] * len(headers)); insert = f"INSERT INTO {_quote(table)} ({quoted}) VALUES ({placeholders})"
         order_index = headers.index("Order ID")
+        batch = []
         for row_number, raw in enumerate(rows, 2):
             values = _row_values(raw, source_headers, headers, kind == "crm")
             if values is None: summary["failed_rows"] += 1; continue
             if not values: continue
             summary["total_rows"] += 1; digest = row_hash(values)
-            try:
-                conn.start_transaction(); cursor.execute("SAVEPOINT import_row")
-                if kind == "crm":
-                    cursor.execute("SELECT 1 FROM crm_records WHERE `Order ID`=%s LIMIT 1", (values[order_index],))
-                    if cursor.fetchone(): summary["skipped_rows"] += 1; conn.rollback(); continue
-                    cursor.execute(insert, values); cursor.execute("INSERT IGNORE INTO imported_record_hashes (record_hash) VALUES (%s)", (digest,))
-                else:
-                    cursor.execute("INSERT IGNORE INTO imported_record_hashes (record_hash) VALUES (%s)", (digest,))
-                    if cursor.rowcount == 0: summary["skipped_rows"] += 1; conn.rollback(); continue
-                    cursor.execute(insert, values)
-                conn.commit(); summary["inserted_rows"] += 1
-            except mysql.connector.Error:
-                conn.rollback(); summary["failed_rows"] += 1
+            batch.append((values, digest))
+            if len(batch) == BATCH_SIZE:
+                if kind == "crm": _import_crm_batch(cursor, conn, insert, order_index, batch, summary)
+                else: _import_cases_batch(cursor, conn, insert, batch, summary)
+                batch = []
+        if batch:
+            if kind == "crm": _import_crm_batch(cursor, conn, insert, order_index, batch, summary)
+            else: _import_cases_batch(cursor, conn, insert, batch, summary)
         if book: book.close()
     except Exception as error:
         if book: book.close()
