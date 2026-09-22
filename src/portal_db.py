@@ -12,25 +12,25 @@ from mysql.connector import pooling
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Portal and admin credentials are loaded only from this project's local configuration.
+# Local configuration is a development fallback; deployed services use environment variables.
 ENV_FILES = (PROJECT_ROOT / ".env",)
 POOL_NAME = "durafit_portal_readonly"
 _pool: pooling.MySQLConnectionPool | None = None
 
 
 def _read_local_env() -> dict[str, str]:
-    """Read local configuration without printing any values or secrets."""
+    """Read configuration without printing any values or secrets."""
+    values: dict[str, str] = {}
     for path in ENV_FILES:
         if not path.is_file():
             continue
-        values: dict[str, str] = {}
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
-        return values
-    raise RuntimeError("Local MySQL configuration file was not found.")
+    values.update({key: value for key, value in os.environ.items() if value})
+    return values
 
 
 def mysql_options(database: str = "durafit_crm", pool: bool = True) -> dict[str, object]:
@@ -49,6 +49,8 @@ def mysql_options(database: str = "durafit_crm", pool: bool = True) -> dict[str,
         "use_unicode": True,
         "autocommit": True,
     }
+    if values.get("MYSQL_SSL_REQUIRED", "").casefold() == "true":
+        options["ssl_disabled"] = False
     if pool:
         options.update({"pool_name": POOL_NAME, "pool_size": 5, "pool_reset_session": True})
     return options
