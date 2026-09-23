@@ -10,41 +10,44 @@ export default function AdminDashboard() {
   const [token, setToken] = useState(sessionStorage.getItem('durafit_admin_token')); const [credentials, setCredentials] = useState({ username: '', password: '' })
   const [section, setSection] = useState(() => Object.entries(routes).find(([, path]) => path === window.location.pathname)?.[0] || 'dashboard')
   const [stats, setStats] = useState(null); const [history, setHistory] = useState([]); const [error, setError] = useState(''); const [loading, setLoading] = useState(false)
-  const [file, setFile] = useState(null); const [dry, setDry] = useState(null); const [result, setResult] = useState(null); const [busy, setBusy] = useState(false)
-  const [importStartedAt, setImportStartedAt] = useState(null); const [importNow, setImportNow] = useState(0); const [importCompletedSeconds, setImportCompletedSeconds] = useState(null)
+  const [importStates, setImportStates] = useState({ crm: { file: null, dry: null, result: null, busy: false, startedAt: null, now: 0, completedSeconds: null }, cases: { file: null, dry: null, result: null, busy: false, startedAt: null, now: 0, completedSeconds: null } })
   const [list, setList] = useState(null); const [search, setSearch] = useState(''); const [crm, setCrm] = useState('all'); const [caseStatus, setCaseStatus] = useState('all'); const [detail, setDetail] = useState(null)
   const load = async () => { setLoading(true); try { const [a, b] = await Promise.all([request('/api/admin/stats', token), request('/api/admin/import/history', token)]); if (a.status === 401) return logout(); if (!a.ok) throw Error(); setStats(await a.json()); if (b.ok) setHistory(await b.json()) } catch { setError('Unable to load dashboard statistics.') } finally { setLoading(false) } }
   const loadCases = async () => { const q = new URLSearchParams({ search, crm_status: crm, case_status: caseStatus }); const r = await request(`/api/admin/customer-cases?${q}`, token); if (r.ok) setList(await r.json()); else setError('Unable to load customer cases.') }
   useEffect(() => { if (token) load() }, [token]); useEffect(() => { if (token && section === 'customer') loadCases() }, [token, section])
   useEffect(() => {
-    if (!busy || !importStartedAt) return undefined
-    setImportNow(Date.now())
-    const interval = window.setInterval(() => setImportNow(Date.now()), 1000)
+    const currentType = section === 'crm' ? 'crm' : 'cases'
+    const currentImport = importStates[currentType]
+    if (!currentImport.busy || !currentImport.startedAt) return undefined
+    const updateNow = () => setImportStates(states => ({ ...states, [currentType]: { ...states[currentType], now: Date.now() } }))
+    updateNow()
+    const interval = window.setInterval(updateNow, 1000)
     return () => window.clearInterval(interval)
-  }, [busy, importStartedAt])
+  }, [section, importStates])
   const login = async (event) => { event.preventDefault(); const body = new FormData(); body.append('username', credentials.username); body.append('password', credentials.password); const r = await fetch(`${API}/api/admin/login`, { method: 'POST', body }); const data = await r.json().catch(() => ({})); if (!r.ok) return setError('Invalid username or password'); sessionStorage.setItem('durafit_admin_token', data.token); setToken(data.token); window.history.replaceState({}, '', '/admin') }
   const logout = async () => { try { if (token) await request('/api/admin/logout', token, { method: 'POST' }) } finally { sessionStorage.removeItem('durafit_admin_token'); setToken(null); window.history.replaceState({}, '', '/admin/login') } }
-  const nav = (next) => { setSection(next); window.history.pushState({}, '', routes[next]); setError(''); setDry(null); setResult(null); setDetail(null) }
+  const nav = (next) => { setSection(next); window.history.pushState({}, '', routes[next]); setError(''); setDetail(null) }
   const upload = async (final) => {
-    if (!file) return setError('Choose an .xlsx file first.')
+    const type = section === 'crm' ? 'crm' : 'cases'; const currentImport = importStates[type]
+    if (!currentImport.file) return setError('Choose an .xlsx file first.')
     const startedAt = Date.now()
-    setBusy(true); setError(''); setImportStartedAt(startedAt); setImportNow(startedAt); setImportCompletedSeconds(null)
-    const type = section === 'crm' ? 'crm' : 'cases'; const body = new FormData(); body.append('file', file)
+    setImportStates(states => ({ ...states, [type]: { ...states[type], busy: true, startedAt, now: startedAt, completedSeconds: null } })); setError('')
+    const body = new FormData(); body.append('file', currentImport.file)
     try {
       const r = await request(`/api/admin/import/${type}${final ? '' : '/dry-run'}`, token, { method: 'POST', body })
       const data = await r.json()
       if (!r.ok) throw Error(data.detail || 'Import failed')
-      if (final) { setResult(data); load() } else setDry(data)
-      setImportCompletedSeconds(Math.max(1, Math.ceil((Date.now() - startedAt) / 1000)))
-    } catch (e) { setError(e.message) } finally { setBusy(false) }
+      const completedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1000))
+      setImportStates(states => ({ ...states, [type]: { ...states[type], ...(final ? { result: data } : { dry: data }), completedSeconds } })); if (final) load()
+    } catch (e) { setError(e.message) } finally { setImportStates(states => ({ ...states, [type]: { ...states[type], busy: false } })) }
   }
   const open = async (id) => { const r = await request(`/api/admin/customer-cases/${id}`, token); if (r.ok) setDetail(await r.json()) }
   const download = async (attachment) => { const r = await request(`/api/admin/customer-cases/${detail.submission_id}/attachments/${attachment.attachment_id}`, token); if (!r.ok) return setError('Attachment unavailable.'); const url = URL.createObjectURL(await r.blob()); const a = document.createElement('a'); a.href = url; a.download = attachment.original_filename; a.click(); URL.revokeObjectURL(url) }
   if (!token) return <main className="admin-login"><section><PortalBrand /><h1>Admin Login</h1><form onSubmit={login}><input placeholder="Username" onChange={e => setCredentials({ ...credentials, username: e.target.value })} /><input type="password" placeholder="Password" onChange={e => setCredentials({ ...credentials, password: e.target.value })} /><button>Login</button></form>{error && <p className="admin-error">{error}</p>}</section></main>
-  const type = section === 'crm' ? 'CRM' : 'Cases'
-  const elapsedSeconds = busy && importStartedAt ? Math.floor((importNow - importStartedAt) / 1000) : 0
-  const importStatus = busy ? (elapsedSeconds < 50 ? `Working... ${50 - elapsedSeconds}s` : 'Working... Still processing...') : importCompletedSeconds ? `Completed in ${importCompletedSeconds}s` : ''
-  return <div className="admin-shell"><aside><PortalBrand /><h2>Admin</h2>{[['dashboard','Dashboard'],['crm','CRM Import'],['cases','Cases Import'],['customer','Customer Cases'],['history','Import History']].map(([id,label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => nav(id)}>{label}</button>)}<button className="logout" onClick={logout}>Logout</button></aside><main><div className="admin-title"><div><h1>Durafit91 Admin Dashboard</h1><p>Live operational overview</p></div>{section === 'dashboard' && <button onClick={load} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>}</div>{error && <p className="admin-error">{error}</p>}{section === 'dashboard' && <Dashboard stats={stats} loading={loading}/>} {(section === 'crm' || section === 'cases') && <Import type={type} file={file} setFile={setFile} dry={dry} result={result} busy={busy} importStatus={importStatus} upload={upload}/>} {section === 'history' && <History rows={history}/>} {section === 'customer' && <CustomerCases data={list} search={search} setSearch={setSearch} crm={crm} setCrm={setCrm} caseStatus={caseStatus} setCaseStatus={setCaseStatus} load={loadCases} open={open}/>} {detail && <Detail value={detail} close={() => setDetail(null)} download={download}/>}</main></div>
+  const type = section === 'crm' ? 'crm' : 'cases'; const currentImport = importStates[type]; const displayType = type === 'crm' ? 'CRM' : 'Cases'
+  const elapsedSeconds = currentImport.busy && currentImport.startedAt ? Math.floor((currentImport.now - currentImport.startedAt) / 1000) : 0
+  const importStatus = currentImport.busy ? (elapsedSeconds < 50 ? `Working... ${50 - elapsedSeconds}s` : 'Working... Still processing...') : currentImport.completedSeconds ? `Completed in ${currentImport.completedSeconds}s` : ''
+  return <div className="admin-shell"><aside><PortalBrand /><h2>Admin</h2>{[['dashboard','Dashboard'],['crm','CRM Import'],['cases','Cases Import'],['customer','Customer Cases'],['history','Import History']].map(([id,label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => nav(id)}>{label}</button>)}<button className="logout" onClick={logout}>Logout</button></aside><main><div className="admin-title"><div><h1>Durafit91 Admin Dashboard</h1><p>Live operational overview</p></div>{section === 'dashboard' && <button onClick={load} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>}</div>{error && <p className="admin-error">{error}</p>}{section === 'dashboard' && <Dashboard stats={stats} loading={loading}/>} {(section === 'crm' || section === 'cases') && <Import type={displayType} file={currentImport.file} setFile={file => setImportStates(states => ({ ...states, [type]: { ...states[type], file } }))} dry={currentImport.dry} result={currentImport.result} busy={currentImport.busy} importStatus={importStatus} upload={upload}/>} {section === 'history' && <History rows={history}/>} {section === 'customer' && <CustomerCases data={list} search={search} setSearch={setSearch} crm={crm} setCrm={setCrm} caseStatus={caseStatus} setCaseStatus={setCaseStatus} load={loadCases} open={open}/>} {detail && <Detail value={detail} close={() => setDetail(null)} download={download}/>}</main></div>
 }
 
 function Dashboard({ stats, loading }) {
