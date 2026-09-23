@@ -24,7 +24,25 @@ export default function AdminDashboard() {
     const interval = window.setInterval(updateNow, 1000)
     return () => window.clearInterval(interval)
   }, [section, importStates])
-  const login = async (event) => { event.preventDefault(); const body = new FormData(); body.append('username', credentials.username); body.append('password', credentials.password); const r = await fetch(`${API}/api/admin/login`, { method: 'POST', body }); const data = await r.json().catch(() => ({})); if (!r.ok) return setError('Invalid username or password'); sessionStorage.setItem('durafit_admin_token', data.token); setToken(data.token); window.history.replaceState({}, '', '/admin') }
+  const login = async (event) => {
+    event.preventDefault()
+    setError('')
+    if (!API) return setError('The admin service is not configured.')
+    const body = new FormData()
+    body.append('username', credentials.username)
+    body.append('password', credentials.password)
+    try {
+      const response = await fetch(`${API}/api/admin/login`, { method: 'POST', body })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 401) return setError('Invalid username or password.')
+      if (!response.ok) return setError('The admin service is unavailable. Please try again shortly.')
+      sessionStorage.setItem('durafit_admin_token', data.token)
+      setToken(data.token)
+      window.history.replaceState({}, '', '/admin')
+    } catch {
+      setError('Cannot reach the admin service. Please ensure the backend is running.')
+    }
+  }
   const logout = async () => { try { if (token) await request('/api/admin/logout', token, { method: 'POST' }) } finally { sessionStorage.removeItem('durafit_admin_token'); setToken(null); window.history.replaceState({}, '', '/admin/login') } }
   const nav = (next) => { setSection(next); window.history.pushState({}, '', routes[next]); setError(''); setDetail(null) }
   const upload = async (final) => {

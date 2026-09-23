@@ -14,7 +14,7 @@ export default function Sidebar({ open, onClose }) {
     <aside className={`sidebar ${open ? 'sidebar--open' : ''}`}>
       <div className="brand">
         <span className="brand-mark">D</span>
-        <span><strong>Durafit</strong><b>91</b></span>
+        <span><strong>siva</strong><b>91</b></span>
       </div>
       <p className="nav-label">Workspace</p>
       <nav>

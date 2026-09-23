@@ -101,7 +101,7 @@ async def create_submission(fields: dict[str, str], invoice_image: UploadFile | 
     if len(attachments) > MAX_ATTACHMENTS:
         raise HTTPException(status_code=422, detail="A maximum of five attachments is allowed")
     order_id = fields["order_id"].strip()
-    options = mysql_options(database="durafit_portal", pool=False)
+    options = mysql_options(database="durafit_portal")
     conn = mysql.connector.connect(**options)
     directory: Path | None = None
     try:

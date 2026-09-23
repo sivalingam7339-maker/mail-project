@@ -76,7 +76,7 @@ export default function CustomerCasePortal() {
   return <div className="support-page">
     <header className="support-topbar"><PortalBrand /><p>Durable Fitness. Stronger You.</p></header>
     <main className="support-content">
-      <section className="support-hero"><div><p>We are here to help</p><h1>Customer Support Request</h1><span>Thank you for reaching out to Durafit. Please share the details below so our team can assist you as quickly as possible.</span></div><SupportIllustration /></section>
+      <section className="support-hero"><div><p>We are here to help</p><h1>Customer Support</h1><span>Thank you for reaching out to Durafit91. Please share the details below so our team can assist you as quickly as possible.</span></div><SupportIllustration /></section>
       <form className="support-form" onSubmit={submit} noValidate>
         <FormCard number="1" label="Full Name" helper="Enter your full name" required error={errors.full_name}><input name="full_name" value={form.full_name} onChange={update} placeholder="Your name" /></FormCard>
         <FormCard number="2" label="Phone Number" helper="Enter your 10-digit mobile number. An alternate number is optional." required error={errors.phone}><div className="support-number-grid"><input name="phone" aria-label="Phone Number" inputMode="tel" value={form.phone} onChange={update} placeholder="Primary number" /><input name="alternate_number" aria-label="Alternate Number" inputMode="tel" value={form.alternate_number} onChange={update} placeholder="Alternate number (optional)" /></div></FormCard>
