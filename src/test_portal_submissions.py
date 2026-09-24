@@ -24,8 +24,7 @@ class PortalSubmissionTests(unittest.TestCase):
                 cls.crm_row_count_before = cur.fetchone()[0]
             finally:
                 cur.close()
-        cls.idempotency_key = "22222222-2222-4222-8222-222222222222"
-        cls.case_id = None
+        cls.idempotency_key = str(uuid.uuid4())
 
     @staticmethod
     def form_data(order_id, key):
@@ -42,17 +41,19 @@ class PortalSubmissionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertTrue(body["success"])
-        self.assertTrue(body["case_id"].startswith("DF91-CASE-"))
+        self.assertIsNone(body.get("case_id"))
+        self.assertEqual(body.get("status"), "pending_verification")
         self.assertNotIn("password", str(body).lower())
-        self.__class__.case_id = body["case_id"]
+        self.__class__.submission_id = body["submission_id"]
         with portal_db.connection() as crm:
             cur = crm.cursor(); cur.execute("SELECT COUNT(*) FROM `durafit_crm`.`crm_records`"); self.assertEqual(cur.fetchone()[0], self.crm_row_count_before); cur.close()
         opts = portal_db.mysql_options(database="durafit_portal", pool=False)
         import mysql.connector
         conn = mysql.connector.connect(**opts); cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM portal_submission_attachments WHERE submission_id=UUID_TO_BIN(%s)", (body["submission_id"],)); self.assertEqual(cur.fetchone()[0], 3)
+        cur.execute("SELECT COUNT(*) FROM portal_cases WHERE submission_id=UUID_TO_BIN(%s)", (body["submission_id"],)); self.assertEqual(cur.fetchone()[0], 0)
         cur.execute("SELECT COUNT(*) FROM portal_email_outbox WHERE submission_id=UUID_TO_BIN(%s) AND message_type='customer_confirmation'", (body["submission_id"],)); self.assertEqual(cur.fetchone()[0], 1)
-        cur.execute("SELECT state, subject FROM portal_submissions WHERE submission_id=UUID_TO_BIN(%s)", (body["submission_id"],)); self.assertEqual(cur.fetchone(), (None, None))
+        cur.execute("SELECT state, subject, submission_status FROM portal_submissions WHERE submission_id=UUID_TO_BIN(%s)", (body["submission_id"],)); self.assertEqual(cur.fetchone(), (None, None, "pending_verification"))
         cur.close(); conn.close()
 
     def test_02_same_idempotency_key_replays_without_duplicates(self):
@@ -60,9 +61,10 @@ class PortalSubmissionTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.post("/api/submissions", data=self.form_data(self.order_id, self.idempotency_key), files=files)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["case_id"], self.case_id)
+        self.assertIsNone(response.json().get("case_id"))
+        self.assertEqual(response.json()["submission_id"], self.submission_id)
 
-    def test_03_crm_missing_order_still_creates_submission_and_case(self):
+    def test_03_crm_missing_order_still_creates_submission_without_case(self):
         key = str(uuid.uuid4())
         missing_order = "__portal_crm_missing_" + uuid.uuid4().hex
         files = {"invoice_image": ("invalid.png", io.BytesIO(b"invalid"), "image/png")}
@@ -73,8 +75,8 @@ class PortalSubmissionTests(unittest.TestCase):
         import mysql.connector
         conn = mysql.connector.connect(**opts); cur = conn.cursor()
         submission_id=response.json()["submission_id"]
-        cur.execute("SELECT order_id,crm_order_id,crm_product_name FROM portal_submissions WHERE idempotency_key=%s", (key,)); self.assertEqual(cur.fetchone(), (missing_order,None,None))
-        cur.execute("SELECT COUNT(*) FROM portal_cases WHERE submission_id=UUID_TO_BIN(%s) AND crm_order_id IS NULL", (submission_id,)); self.assertEqual(cur.fetchone()[0], 1)
+        cur.execute("SELECT order_id,crm_order_id,crm_product_name,submission_status FROM portal_submissions WHERE idempotency_key=%s", (key,)); self.assertEqual(cur.fetchone(), (missing_order,None,None,"pending_verification"))
+        cur.execute("SELECT COUNT(*) FROM portal_cases WHERE submission_id=UUID_TO_BIN(%s)", (submission_id,)); self.assertEqual(cur.fetchone()[0], 0)
         cur.close(); conn.close()
         credentials=portal_db._read_local_env()
         with TestClient(app) as client:
@@ -82,6 +84,38 @@ class PortalSubmissionTests(unittest.TestCase):
             rows=client.get('/api/admin/customer-cases',params={'search':missing_order},headers={'Authorization':f'Bearer {token}'}).json()['items']
         self.assertEqual(rows[0]['crm_status'], 'Order ID Not Found')
         self.assertEqual(rows[0]['case_statuses'], ['Need to Create Case'])
+
+    def test_04_submission_accepted_when_order_id_already_exists_in_durafit_cases(self):
+        with portal_db.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT `Order ID` FROM `durafit_cases`.`case_records` WHERE `Order ID` IS NOT NULL AND `Order ID` <> '' LIMIT 1")
+                row = cur.fetchone()
+                existing_case_order_id = row[0] if row else "OD338303328366816100"
+            finally:
+                cur.close()
+
+        key = str(uuid.uuid4())
+        files = {"invoice_image": ("invoice_case_exists.png", io.BytesIO(b"invoice_case_exists"), "image/png")}
+        with TestClient(app) as client:
+            response = client.post("/api/submissions", data=self.form_data(existing_case_order_id, key), files=files)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertIsNone(body.get("case_id"))
+        self.assertEqual(body.get("status"), "pending_verification")
+
+        opts = portal_db.mysql_options(database="durafit_portal", pool=False)
+        import mysql.connector
+        conn = mysql.connector.connect(**opts); cur = conn.cursor()
+        sub_id = body["submission_id"]
+        cur.execute("SELECT order_id, submission_status FROM portal_submissions WHERE submission_id=UUID_TO_BIN(%s)", (sub_id,))
+        self.assertEqual(cur.fetchone(), (existing_case_order_id, "pending_verification"))
+        cur.execute("SELECT COUNT(*) FROM portal_cases WHERE submission_id=UUID_TO_BIN(%s)", (sub_id,))
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM portal_email_outbox WHERE submission_id=UUID_TO_BIN(%s) AND message_type='customer_confirmation'", (sub_id,))
+        self.assertEqual(cur.fetchone()[0], 1)
+        cur.close(); conn.close()
 
 
 if __name__ == "__main__":

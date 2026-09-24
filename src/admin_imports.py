@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import io
+import json
 import uuid
 
 import mysql.connector
@@ -343,3 +344,132 @@ def history(limit=50):
     try:
         cur.execute("SELECT BIN_TO_UUID(import_id) AS import_id,import_type,original_filename,started_at,completed_at,total_rows,inserted_rows,skipped_rows,failed_rows,status,error_summary FROM portal_import_history ORDER BY created_at DESC LIMIT %s", (min(max(limit,1),100),)); return cur.fetchall()
     finally: cur.close();conn.close()
+
+
+def customer_submissions(page=1, page_size=25, search='', crm_status='all', case_status='all', submission_status='all'):
+    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    try:
+        where=[];params=[]
+        if search:
+            where.append('(s.order_id LIKE %s OR s.full_name LIKE %s OR s.phone_number LIKE %s)');params += [f'%{search}%']*3
+        if crm_status == 'Order ID Exists':
+            where.append('EXISTS (SELECT 1 FROM `durafit_crm`.`crm_records` c WHERE c.`Order ID`=s.order_id)')
+        elif crm_status == 'Order ID Not Found':
+            where.append('NOT EXISTS (SELECT 1 FROM `durafit_crm`.`crm_records` c WHERE c.`Order ID`=s.order_id)')
+        if case_status == 'Need to Create Case':
+            where.append('NOT EXISTS (SELECT 1 FROM `durafit_cases`.`case_records` k WHERE k.`Order ID`=s.order_id)')
+        elif case_status != 'all':
+            where.append('EXISTS (SELECT 1 FROM `durafit_cases`.`case_records` k WHERE k.`Order ID`=s.order_id AND k.`Status`=%s)');params.append(case_status)
+        if submission_status in ('pending_verification', 'Pending Verification'):
+            where.append("s.submission_status IN ('pending_verification', 'received')")
+        elif submission_status in ('moved_to_cases', 'Moved to Cases'):
+            where.append("s.submission_status = 'moved_to_cases'")
+        elif submission_status != 'all':
+            where.append("s.submission_status = %s");params.append(submission_status)
+        clause=(' WHERE '+' AND '.join(where)) if where else ''
+        cur.execute(f"SELECT COUNT(*) AS total FROM portal_submissions s{clause}",params);total=cur.fetchone()['total']
+        cur.execute(f"""SELECT BIN_TO_UUID(s.submission_id) submission_id,s.created_at,s.order_id,s.full_name,s.phone_number,
+                       s.alternate_number,s.customer_address,s.pincode,s.crm_product_name,s.crm_purchased_product,
+                       s.issue_category,s.detailed_description,s.submission_status
+                       FROM portal_submissions s{clause} ORDER BY s.created_at DESC LIMIT %s OFFSET %s""",
+                    params+[page_size,(page-1)*page_size])
+        rows=cur.fetchall();ids=[r['order_id'] for r in rows]
+        crm=set();statuses={}
+        if ids:
+            marks=','.join(['%s']*len(ids));cur.execute(f"SELECT `Order ID` FROM `durafit_crm`.`crm_records` WHERE `Order ID` IN ({marks})",ids);crm={r['Order ID'] for r in cur.fetchall()}
+            cur.execute(f"SELECT `Order ID`,`Status` FROM `durafit_cases`.`case_records` WHERE `Order ID` IN ({marks})",ids)
+            for r in cur.fetchall(): statuses.setdefault(r['Order ID'],[]).append(r['Status'] or 'Not Available')
+        out=[]
+        for row in rows:
+            row['crm_status']='Order ID Exists' if row['order_id'] in crm else 'Order ID Not Found'
+            row['case_statuses']=statuses.get(row['order_id'],['Need to Create Case'])
+            raw_st = row.get('submission_status') or 'pending_verification'
+            row['submission_status_display'] = 'Moved to Cases' if raw_st == 'moved_to_cases' else 'Pending Verification'
+            out.append(row)
+        cur.execute("SELECT DISTINCT `Status` AS value FROM `durafit_cases`.`case_records` WHERE `Status` IS NOT NULL AND TRIM(`Status`)<>'' ORDER BY `Status`")
+        return {'items':out,'page':page,'page_size':page_size,'total':total,'case_status_options':[r['value'] for r in cur.fetchall()]}
+    finally:cur.close();conn.close()
+
+
+def update_customer_submission(submission_id: str, fields: dict) -> dict | None:
+    try: submission = uuid.UUID(submission_id)
+    except ValueError: return None
+    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT BIN_TO_UUID(submission_id) sub_id, order_id FROM portal_submissions WHERE submission_id=%s", (submission.bytes,))
+        existing = cur.fetchone()
+        if not existing:
+            return None
+        new_order_id = fields.get('order_id', existing['order_id']).strip()
+        cur.execute("""SELECT `Order ID`, `Product Name`, `Purchased Product`, `SKU new`, `Name`, `Mobile Number`, `Customer Email`, `Sales Order Owner`
+                       FROM `durafit_crm`.`crm_records` WHERE `Order ID` = %s LIMIT 1""", (new_order_id,))
+        crm_snap = cur.fetchone()
+
+        cur.execute("""
+            UPDATE portal_submissions
+            SET full_name = %s,
+                phone_number = %s,
+                alternate_number = %s,
+                order_id = %s,
+                customer_address = %s,
+                pincode = %s,
+                issue_category = %s,
+                detailed_description = %s,
+                crm_order_id = %s,
+                crm_product_name = %s,
+                crm_purchased_product = %s,
+                crm_sku_new = %s,
+                crm_customer_name = %s,
+                crm_mobile_number = %s,
+                crm_customer_email = %s,
+                crm_sales_order_owner = %s,
+                updated_at = NOW(6)
+            WHERE submission_id = %s
+        """, (
+            fields['full_name'].strip(),
+            fields['phone_number'].strip(),
+            (fields.get('alternate_number') or '').strip() or None,
+            new_order_id,
+            fields['customer_address'].strip(),
+            fields['pincode'].strip(),
+            fields['issue_category'].strip(),
+            fields['detailed_description'].strip(),
+            crm_snap['Order ID'] if crm_snap else None,
+            crm_snap['Product Name'] if crm_snap else None,
+            crm_snap['Purchased Product'] if crm_snap else None,
+            crm_snap['SKU new'] if crm_snap else None,
+            crm_snap['Name'] if crm_snap else None,
+            crm_snap['Mobile Number'] if crm_snap else None,
+            crm_snap['Customer Email'] if crm_snap else None,
+            crm_snap['Sales Order Owner'] if crm_snap else None,
+            submission.bytes,
+        ))
+        cur.execute("""
+            INSERT INTO portal_submission_events (submission_id, case_id, event_type, event_payload, created_at)
+            VALUES (%s, NULL, 'submission_edited_by_admin', %s, NOW(6))
+        """, (submission.bytes, json.dumps({"updated_fields": list(fields.keys())})))
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+    return customer_case_detail(submission_id)
+
+
+def move_submission_to_cases_placeholder(submission_id: str) -> dict | None:
+    try: submission = uuid.UUID(submission_id)
+    except ValueError: return None
+    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT BIN_TO_UUID(submission_id) sub_id, order_id, submission_status FROM portal_submissions WHERE submission_id=%s", (submission.bytes,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "success": True,
+            "submission_id": submission_id,
+            "order_id": row["order_id"],
+            "status": "ready_for_case_creation",
+            "message": "Move to Cases action triggered. Case creation will be executed in Step 3."
+        }
+    finally:
+        cur.close(); conn.close()
+

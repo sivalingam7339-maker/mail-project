@@ -23,6 +23,18 @@ class OrderLookupResponse(BaseModel):
 class SubmissionResponse(BaseModel):
     success: bool
     submission_id: str
-    case_id: str
+    case_id: str | None = None
     status: str
     message: str
+
+
+class SubmissionUpdateRequest(BaseModel):
+    full_name: str
+    phone_number: str
+    alternate_number: str | None = None
+    order_id: str
+    customer_address: str
+    pincode: str
+    issue_category: str
+    detailed_description: str
+

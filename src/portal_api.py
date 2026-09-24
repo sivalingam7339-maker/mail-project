@@ -8,10 +8,14 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.portal_db import close_pool, find_order
-from src.portal_models import OrderLookupResponse, SubmissionResponse
+from src.portal_models import OrderLookupResponse, SubmissionResponse, SubmissionUpdateRequest
 from src.portal_submissions import create_submission
 from src.admin_auth import authenticate, require_admin, revoke
-from src.admin_imports import attachment_path, customer_case_detail, customer_cases, dry_run, history as import_history, import_xlsx, stats_and_history
+from src.admin_imports import (
+    attachment_path, customer_case_detail, customer_cases, customer_submissions,
+    dry_run, history as import_history, import_xlsx, move_submission_to_cases_placeholder,
+    stats_and_history, update_customer_submission,
+)
 from src.portal_submissions import STORAGE_ROOT
 
 
@@ -83,6 +87,54 @@ def get_customer_attachment(submission_id: str, attachment_id: str, _: str = Dep
     return FileResponse(path, media_type=record['content_type'] or 'application/octet-stream', filename=record['original_filename'])
 
 
+@app.get("/api/admin/customer-submissions")
+def list_customer_submissions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    search: str = "",
+    crm_status: str = "all",
+    case_status: str = "all",
+    submission_status: str = "all",
+    _: str = Depends(require_admin),
+) -> dict:
+    return customer_submissions(page, page_size, search.strip(), crm_status, case_status, submission_status)
+
+
+@app.get("/api/admin/customer-submissions/{submission_id}")
+def get_customer_submission(submission_id: str, _: str = Depends(require_admin)) -> dict:
+    result = customer_case_detail(submission_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Customer submission not found")
+    return result
+
+
+@app.put("/api/admin/customer-submissions/{submission_id}")
+def put_customer_submission(submission_id: str, body: SubmissionUpdateRequest, _: str = Depends(require_admin)) -> dict:
+    result = update_customer_submission(submission_id, body.model_dump())
+    if result is None:
+        raise HTTPException(status_code=404, detail="Customer submission not found")
+    return result
+
+
+@app.post("/api/admin/customer-submissions/{submission_id}/move-to-cases")
+def move_submission_to_cases(submission_id: str, _: str = Depends(require_admin)) -> dict:
+    result = move_submission_to_cases_placeholder(submission_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Customer submission not found")
+    return result
+
+
+@app.get("/api/admin/customer-submissions/{submission_id}/attachments/{attachment_id}")
+def get_submission_attachment(submission_id: str, attachment_id: str, _: str = Depends(require_admin)):
+    record = attachment_path(submission_id, attachment_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = (STORAGE_ROOT / record['storage_key']).resolve()
+    if STORAGE_ROOT.resolve() not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="Attachment file is unavailable")
+    return FileResponse(path, media_type=record['content_type'] or 'application/octet-stream', filename=record['original_filename'])
+
+
 @app.get("/api/admin/import/history")
 def get_import_history(_: str = Depends(require_admin)) -> list[dict]:
     return import_history()
@@ -132,4 +184,4 @@ async def submit_request(
         raise
     except mysql.connector.Error:
         raise HTTPException(status_code=503, detail="Submission service is temporarily unavailable")
-    return SubmissionResponse(success=True, submission_id=result["submission_id"], case_id=result["case_id"], status=result["status"], message="Your service request has been submitted successfully.")
+    return SubmissionResponse(success=True, submission_id=result["submission_id"], case_id=result.get("case_id"), status=result["status"], message="Your service request has been submitted successfully.")
