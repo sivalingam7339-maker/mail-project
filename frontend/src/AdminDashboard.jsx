@@ -117,7 +117,9 @@ export default function AdminDashboard() {
       })
       const data = await r.json()
       if (!r.ok) throw Error(data.detail || 'Move to Cases failed')
-      setMoveMessage(data.message || 'Move to Cases action registered.')
+      setMoveMessage(data.message || `Moved to Cases. Case ID: ${data.case_id}`)
+      await openSubmission(subDetail.submission_id)
+      loadSubmissions()
     } catch (err) {
       setMoveMessage(`Action failed: ${err.message}`)
     }
@@ -307,14 +309,24 @@ function CustomerSubmissionModal({ value, close, onSave, onMove, saveStatus, mov
     onSave(formData)
   }
 
+  const isMoved = value.submission_status === 'moved_to_cases' || !!value.case_id
+
   return (
     <section className="admin-detail submission-modal">
       <div className="modal-header">
         <div>
           <h2>Customer Submission Verification</h2>
-          <p className="modal-subtext">Submission ID: {value.submission_id} • Submitted: {date(value.created_at)}</p>
+          <p className="modal-subtext">
+            Submission ID: {value.submission_id} • Submitted: {date(value.created_at)}
+            {value.case_id && <span className="case-id-badge"> • Case ID: <strong>{value.case_id}</strong></span>}
+          </p>
         </div>
-        <button type="button" className="btn-close" onClick={close}>Close</button>
+        <div className="modal-header-actions">
+          <span className={`status-badge ${isMoved ? 'badge-moved' : 'badge-pending'}`}>
+            {isMoved ? 'Moved to Cases' : 'Pending Verification'}
+          </span>
+          <button type="button" className="btn-close" onClick={close}>Close</button>
+        </div>
       </div>
 
       {saveStatus && (
@@ -382,7 +394,13 @@ function CustomerSubmissionModal({ value, close, onSave, onMove, saveStatus, mov
 
           <div className="modal-action-bar">
             <button type="submit" className="btn-save">Save Changes</button>
-            <button type="button" className="btn-move" onClick={onMove}>Move to Cases</button>
+            {isMoved ? (
+              <button type="button" className="btn-move btn-moved" disabled title="This submission has already been moved to cases.">
+                ✓ Moved to Cases {value.case_id ? `(${value.case_id})` : ''}
+              </button>
+            ) : (
+              <button type="button" className="btn-move" onClick={onMove}>Move to Cases</button>
+            )}
           </div>
         </form>
 
@@ -416,6 +434,12 @@ function CustomerSubmissionModal({ value, close, onSave, onMove, saveStatus, mov
               <h3>Existing Cases in Database</h3>
               <span className="card-badge">Durafit Cases</span>
             </div>
+            {value.case_id && (
+              <div className="portal-case-callout">
+                <span>Created Case ID:</span>
+                <strong>{value.case_id}</strong>
+              </div>
+            )}
             <div className="case-status-tags">
               {value.case_statuses?.map((st, i) => (
                 <span key={i} className="status-badge case-pill">{st}</span>

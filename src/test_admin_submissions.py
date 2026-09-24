@@ -158,7 +158,7 @@ class AdminCustomerSubmissionsTests(unittest.TestCase):
             cur.close()
             conn.close()
 
-    def test_05_move_to_cases_action_does_not_create_case_in_step_2(self):
+    def test_05_move_to_cases_action(self):
         # Count existing rows in durafit_cases.case_records before
         with portal_db.connection() as conn:
             cur = conn.cursor()
@@ -177,14 +177,15 @@ class AdminCustomerSubmissionsTests(unittest.TestCase):
         data = resp.json()
         self.assertTrue(data["success"])
         self.assertIn("message", data)
+        self.assertIsNotNone(data.get("case_id"))
 
-        # Verify NO row was created in durafit_cases.case_records (Step 2 constraint)
+        # Verify exactly ONE new case row was created in durafit_cases.case_records
         with portal_db.connection() as conn:
             cur = conn.cursor()
             try:
                 cur.execute("SELECT COUNT(*) FROM `durafit_cases`.`case_records`")
                 case_count_after = cur.fetchone()[0]
-                self.assertEqual(case_count_after, case_count_before)
+                self.assertEqual(case_count_after, case_count_before + 1)
             finally:
                 cur.close()
 

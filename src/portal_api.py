@@ -13,8 +13,8 @@ from src.portal_submissions import create_submission
 from src.admin_auth import authenticate, require_admin, revoke
 from src.admin_imports import (
     attachment_path, customer_case_detail, customer_cases, customer_submissions,
-    dry_run, history as import_history, import_xlsx, move_submission_to_cases_placeholder,
-    stats_and_history, update_customer_submission,
+    dry_run, history as import_history, import_xlsx, move_submission_to_cases as admin_move_submission_to_cases,
+    move_submission_to_cases_placeholder, stats_and_history, update_customer_submission,
 )
 from src.portal_submissions import STORAGE_ROOT
 
@@ -117,8 +117,8 @@ def put_customer_submission(submission_id: str, body: SubmissionUpdateRequest, _
 
 
 @app.post("/api/admin/customer-submissions/{submission_id}/move-to-cases")
-def move_submission_to_cases(submission_id: str, _: str = Depends(require_admin)) -> dict:
-    result = move_submission_to_cases_placeholder(submission_id)
+def move_submission_to_cases(submission_id: str, admin: str = Depends(require_admin)) -> dict:
+    result = admin_move_submission_to_cases(submission_id, admin_user=admin)
     if result is None:
         raise HTTPException(status_code=404, detail="Customer submission not found")
     return result
