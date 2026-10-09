@@ -112,27 +112,28 @@ class AdminMoveToCasesTests(unittest.TestCase):
         with portal_db.connection() as conn:
             cur = conn.cursor(dictionary=True)
             try:
-                # 1. Exactly one case_records row for this Order ID with Status = 'Created'
+                # 1. Exactly one case_records row for this Order ID with Status = 'Diagnosis'
                 cur.execute("SELECT * FROM `durafit_cases`.`case_records` WHERE `Order ID` = %s AND `Customer` = %s", (self.order_id_no_cases, cust_name))
                 cases = cur.fetchall()
                 self.assertEqual(len(cases), 1)
-                self.assertEqual(cases[0]["Status"], "Created")
+                self.assertEqual(cases[0]["Status"], "Diagnosis")
 
                 # 2. Exactly one portal_cases row
-                cur.execute("SELECT * FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                pdb = portal_db.portal_database_name()
+                cur.execute(f"SELECT * FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 portal_case = cur.fetchone()
                 self.assertIsNotNone(portal_case)
                 self.assertEqual(portal_case["case_id"], case_id)
                 self.assertEqual(portal_case["case_status"], "created")
 
                 # 3. Submission status updated to moved_to_cases
-                cur.execute("SELECT submission_status FROM `durafit_portal`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                cur.execute(f"SELECT submission_status FROM `{pdb}`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 sub_row = cur.fetchone()
                 self.assertEqual(sub_row["submission_status"], "moved_to_cases")
 
                 # 4. Audit event created
-                cur.execute("""
-                    SELECT * FROM `durafit_portal`.`portal_submission_events`
+                cur.execute(f"""
+                    SELECT * FROM `{pdb}`.`portal_submission_events`
                     WHERE submission_id = UUID_TO_BIN(%s) AND event_type = 'moved_to_cases'
                 """, (sub_id,))
                 event = cur.fetchone()
@@ -187,15 +188,16 @@ class AdminMoveToCasesTests(unittest.TestCase):
                 # Prior cases are intact
                 matching_new = [c for c in after_cases if c["Customer"] == cust_name]
                 self.assertEqual(len(matching_new), 1)
-                self.assertEqual(matching_new[0]["Status"], "Created")
+                self.assertEqual(matching_new[0]["Status"], "Diagnosis")
                 self.assertEqual(matching_new[0]["Case Type"], "Free Installation")
 
                 # Verify submission moved
-                cur.execute("SELECT submission_status FROM `durafit_portal`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                pdb = portal_db.portal_database_name()
+                cur.execute(f"SELECT submission_status FROM `{pdb}`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 self.assertEqual(cur.fetchone()["submission_status"], "moved_to_cases")
 
                 # Verify portal_cases record
-                cur.execute("SELECT case_id FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                cur.execute(f"SELECT case_id FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 self.assertEqual(cur.fetchone()["case_id"], new_case_id)
             finally:
                 cur.close()
@@ -222,12 +224,13 @@ class AdminMoveToCasesTests(unittest.TestCase):
             case_id_1 = data1["case_id"]
 
             # Snapshot counts
+            pdb = portal_db.portal_database_name()
             with portal_db.connection() as conn:
                 cur = conn.cursor()
                 try:
                     cur.execute("SELECT COUNT(*) FROM `durafit_cases`.`case_records` WHERE `Order ID` = %s", (self.order_id_no_cases,))
                     cases_count_after_first = cur.fetchone()[0]
-                    cur.execute("SELECT COUNT(*) FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                    cur.execute(f"SELECT COUNT(*) FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                     portal_cases_count_after_first = cur.fetchone()[0]
                     self.assertEqual(portal_cases_count_after_first, 1)
                 finally:
@@ -252,7 +255,7 @@ class AdminMoveToCasesTests(unittest.TestCase):
                     cases_count_after_second = cur.fetchone()[0]
                     self.assertEqual(cases_count_after_second, cases_count_after_first)
 
-                    cur.execute("SELECT COUNT(*) FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                    cur.execute(f"SELECT COUNT(*) FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                     portal_cases_count_after_second = cur.fetchone()[0]
                     self.assertEqual(portal_cases_count_after_second, 1)
                 finally:
@@ -268,13 +271,14 @@ class AdminMoveToCasesTests(unittest.TestCase):
             desc="Testing rollback upon failure"
         )
 
+        pdb = portal_db.portal_database_name()
         # Count records before
         with portal_db.connection() as conn:
             cur = conn.cursor()
             try:
                 cur.execute("SELECT COUNT(*) FROM `durafit_cases`.`case_records` WHERE `Order ID` = 'FAIL-ROLLBACK-ORDER-999'")
                 case_count_before = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                cur.execute(f"SELECT COUNT(*) FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 portal_count_before = cur.fetchone()[0]
                 self.assertEqual(portal_count_before, 0)
             finally:
@@ -284,7 +288,7 @@ class AdminMoveToCasesTests(unittest.TestCase):
         real_execute = mysql.connector.cursor.MySQLCursor.execute
 
         def failing_execute(cursor_self, operation, params=None, multi=False):
-            if "INSERT INTO `durafit_portal`.`portal_cases`" in str(operation):
+            if "portal_cases" in str(operation) and "INSERT" in str(operation):
                 raise mysql.connector.Error("Simulated database failure during portal_cases insert")
             return real_execute(cursor_self, operation, params, multi)
 
@@ -300,11 +304,11 @@ class AdminMoveToCasesTests(unittest.TestCase):
                 case_count_after = cur.fetchone()["cnt"]
                 self.assertEqual(case_count_after, case_count_before)
 
-                cur.execute("SELECT COUNT(*) as cnt FROM `durafit_portal`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                cur.execute(f"SELECT COUNT(*) as cnt FROM `{pdb}`.`portal_cases` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 portal_count_after = cur.fetchone()["cnt"]
                 self.assertEqual(portal_count_after, 0)
 
-                cur.execute("SELECT submission_status FROM `durafit_portal`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
+                cur.execute(f"SELECT submission_status FROM `{pdb}`.`portal_submissions` WHERE submission_id = UUID_TO_BIN(%s)", (sub_id,))
                 sub_status = cur.fetchone()["submission_status"]
                 self.assertEqual(sub_status, "pending_verification")
             finally:
@@ -367,7 +371,7 @@ class AdminMoveToCasesTests(unittest.TestCase):
                 self.assertEqual(row["Customer"], cust_name)
                 self.assertEqual(row["Mobile"], phone)
                 self.assertEqual(row["Case Type"], category)
-                self.assertEqual(row["Status"], "Created")
+                self.assertEqual(row["Status"], "Diagnosis")
                 self.assertIsNone(row["Spares"])
                 self.assertIn(description, row["Comment"])
                 self.assertIn(address, row["Comment"])

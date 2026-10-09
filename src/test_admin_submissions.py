@@ -219,6 +219,124 @@ class AdminCustomerSubmissionsTests(unittest.TestCase):
             # Existing case status must NOT be 'Need to Create Case' because it already has cases
             self.assertNotEqual(matched[0]["case_statuses"], ["Need to Create Case"])
 
+    def test_07_crm_order_not_found_full_case_schema_save_and_move(self):
+        key = str(uuid.uuid4())
+        missing_order_id = "NO-CRM-" + uuid.uuid4().hex[:10].upper()
+        files = [("invoice_image", ("no_crm_inv.png", io.BytesIO(b"no_crm_inv"), "image/png"))]
+        form = {
+            "idempotency_key": key,
+            "full_name": "Manual CRM Customer",
+            "phone": "9123456780",
+            "alternate_number": "9000011111",
+            "order_id": missing_order_id,
+            "customer_address": "42 Non-CRM Avenue, Chennai",
+            "pincode": "600042",
+            "issue_category": "Belt Slippage",
+            "description": "Belt slips when running above 8 km/h.",
+        }
+        with TestClient(app) as client:
+            sub_resp = client.post("/api/submissions", data=form, files=files)
+            self.assertEqual(sub_resp.status_code, 200)
+            sub_id = sub_resp.json()["submission_id"]
+
+            # 1. Detail endpoint MUST return complete 19-field case_draft even when CRM Order ID is Not Found
+            detail_resp = client.get(f"/api/admin/customer-submissions/{sub_id}", headers=self.auth_headers)
+            self.assertEqual(detail_resp.status_code, 200)
+            detail = detail_resp.json()
+            self.assertEqual(detail["crm_status"], "Order ID Not Found")
+            self.assertIsNone(detail["crm"])
+            draft = detail.get("case_draft")
+            self.assertIsInstance(draft, dict)
+            for required_key in [
+                "case_id", "order_id", "customer", "mobile", "sku", "product",
+                "case_type", "status", "spares", "comment", "so_owner",
+                "welcome_call_agent", "created_by", "created_date", "closed_date",
+                "visit_status", "amount_charged", "amount_to_tech", "technician_resolution"
+            ]:
+                self.assertIn(required_key, draft)
+            self.assertEqual(draft["order_id"], missing_order_id)
+            self.assertEqual(draft["customer"], "Manual CRM Customer")
+            self.assertEqual(draft["mobile"], "9123456780")
+            self.assertEqual(draft["sku"], "")
+            self.assertEqual(draft["product"], "")
+            self.assertEqual(draft["case_type"], "Belt Slippage")
+            self.assertEqual(draft["status"], "Open")
+            self.assertEqual(draft["visit_status"], "Pending")
+
+            # 2. Admin edits all case fields (including manual SKU & Product) and saves changes
+            updated_payload = {
+                "case_id": draft["case_id"],
+                "order_id": missing_order_id,
+                "full_name": "Manual CRM Customer Edited",
+                "phone_number": "9123456789",
+                "sku": "DF-MANUAL-SKU-99",
+                "product": "Durafit Manual Treadmill X1",
+                "case_type": "Belt Alignment & Slippage",
+                "status": "In Progress",
+                "spares": "Running Belt X1",
+                "comment": "Admin verified invoice image and entered SKU/Product manually.",
+                "so_owner": "Siva",
+                "welcome_call_agent": "Priya",
+                "created_by": "Admin Portal",
+                "created_date": "2026-09-26",
+                "closed_date": "",
+                "visit_status": "Scheduled",
+                "amount_charged": "450",
+                "amount_to_tech": "300",
+                "technician_resolution": "Technician scheduled for belt replacement",
+                "alternate_number": "9000011111",
+                "customer_address": "42 Non-CRM Avenue, Chennai",
+                "pincode": "600042",
+                "issue_category": "Belt Slippage",
+                "detailed_description": "Belt slips when running above 8 km/h.",
+            }
+            put_resp = client.put(
+                f"/api/admin/customer-submissions/{sub_id}",
+                json=updated_payload,
+                headers=self.auth_headers,
+            )
+            self.assertEqual(put_resp.status_code, 200)
+            saved = put_resp.json()
+            self.assertEqual(saved["case_draft"]["sku"], "DF-MANUAL-SKU-99")
+            self.assertEqual(saved["case_draft"]["product"], "Durafit Manual Treadmill X1")
+            self.assertEqual(saved["case_draft"]["so_owner"], "Siva")
+
+            # 3. Move to Cases inserts the complete 18-column row into durafit_cases.case_records
+            move_resp = client.post(
+                f"/api/admin/customer-submissions/{sub_id}/move-to-cases",
+                json=updated_payload,
+                headers=self.auth_headers,
+            )
+            self.assertEqual(move_resp.status_code, 200)
+            move_data = move_resp.json()
+            self.assertEqual(move_data["status"], "moved_to_cases")
+            self.assertEqual(move_data["case_id"], draft["case_id"])
+
+            with portal_db.connection() as conn:
+                cur = conn.cursor(dictionary=True)
+                try:
+                    cur.execute(
+                        "SELECT * FROM `durafit_cases`.`case_records` WHERE `Order ID` = %s ORDER BY `Created Date` DESC LIMIT 1",
+                        (missing_order_id,),
+                    )
+                    case_row = cur.fetchone()
+                    self.assertIsNotNone(case_row)
+                    self.assertEqual(case_row["Customer"], "Manual CRM Customer Edited")
+                    self.assertEqual(case_row["Mobile"], "9123456789")
+                    self.assertEqual(case_row["SKU"], "DF-MANUAL-SKU-99")
+                    self.assertEqual(case_row["Product"], "Durafit Manual Treadmill X1")
+                    self.assertEqual(case_row["Case Type"], "Belt Alignment & Slippage")
+                    self.assertEqual(case_row["Status"], "In Progress")
+                    self.assertEqual(case_row["Spares"], "Running Belt X1")
+                    self.assertEqual(case_row["SO Owner"], "Siva")
+                    self.assertEqual(case_row["Welcome Call Agent"], "Priya")
+                    self.assertEqual(case_row["Visit Status"], "Scheduled")
+                    self.assertEqual(case_row["Amount Charged"], "450")
+                    self.assertEqual(case_row["Amount to Tech"], "300")
+                    self.assertEqual(case_row["Technician Resolution"], "Technician scheduled for belt replacement")
+                finally:
+                    cur.close()
+
 
 if __name__ == "__main__":
     unittest.main()

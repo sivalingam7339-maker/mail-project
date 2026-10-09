@@ -1,6 +1,6 @@
 """Response models for the read-only customer portal API."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class OrderLookupResponse(BaseModel):
@@ -29,6 +29,8 @@ class SubmissionResponse(BaseModel):
 
 
 class SubmissionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     full_name: str
     phone_number: str
     alternate_number: str | None = None
@@ -37,4 +39,19 @@ class SubmissionUpdateRequest(BaseModel):
     pincode: str
     issue_category: str
     detailed_description: str
-
+    case_id: str | None = None
+    sku: str | None = None
+    product: str | None = None
+    case_type: str | None = None
+    status: str | None = None
+    spares: str | None = None
+    comment: str | None = None
+    so_owner: str | None = None
+    welcome_call_agent: str | None = None
+    created_by: str | None = None
+    created_date: str | None = None
+    closed_date: str | None = None
+    visit_status: str | None = None
+    amount_charged: str | None = None
+    amount_to_tech: str | None = None
+    technician_resolution: str | None = None

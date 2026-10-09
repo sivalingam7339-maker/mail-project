@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import PortalBrand from './components/PortalBrand'
 
-const API = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
+const API = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
 const routes = { dashboard: '/admin', crm: '/admin/crm-import', cases: '/admin/cases-import', submissions: '/admin/customer-submissions', customer: '/admin/customer-cases', history: '/admin/import-history' }
 const request = (path, token, options = {}) => fetch(`${API}${path}`, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) } })
 const date = (value) => { const m = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T?(\d{2}):(\d{2})/); if (!m) return value || 'None'; const [, y, mo, d, h, mi] = m; const hour = Number(h); return `${d}-${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(mo)-1]}-${y} ${hour % 12 || 12}:${mi} ${hour >= 12 ? 'PM' : 'AM'}` }
@@ -109,11 +110,13 @@ export default function AdminDashboard() {
     }
   }
 
-  const moveToCases = async () => {
+  const moveToCases = async (casePayload) => {
     setMoveMessage('Processing Move to Cases action...')
     try {
       const r = await request(`/api/admin/customer-submissions/${subDetail.submission_id}/move-to-cases`, token, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(casePayload || {}),
       })
       const data = await r.json()
       if (!r.ok) throw Error(data.detail || 'Move to Cases failed')
@@ -191,6 +194,7 @@ export default function AdminDashboard() {
         {subDetail && (
           <CustomerSubmissionModal
             value={subDetail}
+            token={token}
             close={() => setSubDetail(null)}
             onSave={saveSubmission}
             onMove={moveToCases}
@@ -287,18 +291,53 @@ function CustomerSubmissions({ data, search, setSearch, crm, setCrm, caseStatus,
   )
 }
 
-function CustomerSubmissionModal({ value, close, onSave, onMove, saveStatus, moveMessage, download }) {
+function CustomerSubmissionModal({ value, token, close, onSave, onMove, saveStatus, moveMessage, download }) {
   const crm = value.crm || {}
-  const [formData, setFormData] = useState({
-    full_name: value.full_name || '',
-    phone_number: value.phone_number || '',
-    alternate_number: value.alternate_number || '',
-    order_id: value.order_id || '',
-    customer_address: value.customer_address || '',
-    pincode: value.pincode || '',
-    issue_category: value.issue_category || '',
-    detailed_description: value.detailed_description || '',
-  })
+  const draft = value.case_draft || {}
+  const attachments = value.attachments || []
+  const defaultAttachment = attachments.find(a => a.attachment_kind === 'invoice_image') || attachments[0] || null
+
+  const buildFormState = (v) => {
+    const c = v.crm || {}
+    const d = v.case_draft || {}
+    const todayIso = new Date().toISOString().slice(0, 10)
+    const fallbackCaseId = v.case_id || d.case_id || `DF-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(v.submission_id || '').padStart(4, '0')}`
+    return {
+      case_id: d.case_id || fallbackCaseId,
+      order_id: d.order_id || v.order_id || c.order_id || '',
+      full_name: d.customer || v.full_name || c.cx_name || c.account_name || '',
+      phone_number: d.mobile || v.phone_number || '',
+      sku: d.sku || c.sku_new || v.crm_sku_new || '',
+      product: d.product || c.purchased_product || c.product_name || v.crm_purchased_product || v.crm_product_name || '',
+      case_type: d.case_type || v.issue_category || '',
+      status: d.status || 'Open',
+      spares: d.spares || '',
+      comment: d.comment || v.detailed_description || '',
+      so_owner: d.so_owner || '',
+      welcome_call_agent: d.welcome_call_agent || '',
+      created_by: d.created_by || 'Customer Portal',
+      created_date: d.created_date || (v.created_at ? String(v.created_at).slice(0, 10) : todayIso),
+      closed_date: d.closed_date || '',
+      visit_status: d.visit_status || 'Pending',
+      amount_charged: d.amount_charged !== undefined && d.amount_charged !== null ? String(d.amount_charged) : '0',
+      amount_to_tech: d.amount_to_tech !== undefined && d.amount_to_tech !== null ? String(d.amount_to_tech) : '0',
+      technician_resolution: d.technician_resolution || '',
+      alternate_number: v.alternate_number || '',
+      customer_address: v.customer_address || '',
+      pincode: v.pincode || '',
+      issue_category: v.issue_category || '',
+      detailed_description: v.detailed_description || '',
+    }
+  }
+
+  const [formData, setFormData] = useState(() => buildFormState(value))
+  const [selectedAttachment, setSelectedAttachment] = useState(defaultAttachment)
+
+  useEffect(() => {
+    setFormData(buildFormState(value))
+    const firstInv = (value.attachments || []).find(a => a.attachment_kind === 'invoice_image') || (value.attachments || [])[0] || null
+    setSelectedAttachment(firstInv)
+  }, [value.submission_id, value.updated_at])
 
   const handleChange = (field, val) => {
     setFormData(prev => ({ ...prev, [field]: val }))
@@ -306,164 +345,677 @@ function CustomerSubmissionModal({ value, close, onSave, onMove, saveStatus, mov
 
   const handleSubmit = (e) => {
     e.preventDefault()
-    onSave(formData)
+    onSave({
+      ...formData,
+      customer: formData.full_name,
+      mobile: formData.phone_number,
+    })
+  }
+
+  const handleMoveClick = () => {
+    onMove({
+      ...formData,
+      customer: formData.full_name,
+      mobile: formData.phone_number,
+    })
   }
 
   const isMoved = value.submission_status === 'moved_to_cases' || !!value.case_id
+  const activeAttachment = selectedAttachment || defaultAttachment
 
-  return (
-    <section className="admin-detail submission-modal">
-      <div className="modal-header">
-        <div>
-          <h2>Customer Submission Verification</h2>
-          <p className="modal-subtext">
-            Submission ID: {value.submission_id} • Submitted: {date(value.created_at)}
-            {value.case_id && <span className="case-id-badge"> • Case ID: <strong>{value.case_id}</strong></span>}
-          </p>
-        </div>
-        <div className="modal-header-actions">
-          <span className={`status-badge ${isMoved ? 'badge-moved' : 'badge-pending'}`}>
-            {isMoved ? 'Moved to Cases' : 'Pending Verification'}
-          </span>
-          <button type="button" className="btn-close" onClick={close}>Close</button>
-        </div>
-      </div>
-
-      {saveStatus && (
-        <div className={`modal-alert ${saveStatus.includes('failed') || saveStatus.includes('Error') ? 'alert-danger' : 'alert-success'}`}>
-          {saveStatus}
-        </div>
-      )}
-
-      {moveMessage && (
-        <div className="modal-alert alert-info">
-          {moveMessage}
-        </div>
-      )}
-
-      <div className="modal-two-col">
-        {/* Left column: Editable Customer-Entered Fields */}
-        <form onSubmit={handleSubmit} className="admin-edit-card">
-          <div className="card-header">
-            <h3>Customer Form Details (Editable)</h3>
-            <span className="card-badge">Editable</span>
+  return createPortal(
+    <div
+      className="verification-modal-backdrop"
+      role="presentation"
+      style={{
+        position: 'fixed',
+        inset: 0,
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        width: '100vw',
+        height: '100vh',
+        background: 'rgba(0, 0, 0, 0.55)',
+        backdropFilter: 'blur(4px)',
+        WebkitBackdropFilter: 'blur(4px)',
+        zIndex: 999999,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <section
+        className="verification-modal-window"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="submission-verification-title"
+        style={{
+          width: '95vw',
+          height: '92vh',
+          maxWidth: 'none',
+          maxHeight: '92vh',
+          margin: 'auto',
+          borderRadius: '12px',
+          background: '#ffffff',
+          boxShadow: '0 24px 64px rgba(0, 0, 0, 0.35)',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+        }}
+      >
+        {/* 3. HEADER (Full width) */}
+        <header
+          className="verification-modal-header"
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            padding: '14px 24px',
+            borderBottom: '1px solid #dce8e3',
+            background: '#0f352d',
+            color: '#ffffff',
+            flexShrink: 0,
+          }}
+        >
+          <div>
+            <h2 id="submission-verification-title" style={{ margin: 0, fontSize: '20px', color: '#ffffff' }}>
+              Customer Submission Verification
+            </h2>
+            <p className="modal-subtext" style={{ margin: '4px 0 0', color: '#bddbd2', fontSize: '13px' }}>
+              Submission ID: {value.submission_id} • Submitted: {date(value.created_at)}
+              {value.case_id && <span className="case-id-badge"> • Case ID: <strong>{value.case_id}</strong></span>}
+            </p>
           </div>
-
-          <div className="form-row-2">
-            <div className="admin-field">
-              <label>Full Name</label>
-              <input value={formData.full_name} onChange={e => handleChange('full_name', e.target.value)} required />
-            </div>
-            <div className="admin-field">
-              <label>Order ID</label>
-              <input value={formData.order_id} onChange={e => handleChange('order_id', e.target.value)} required />
-            </div>
+          <div className="modal-header-actions" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span className={`status-badge ${isMoved ? 'badge-moved' : 'badge-pending'}`}>
+              {isMoved ? 'Moved to Cases' : 'Pending Verification'}
+            </span>
+            <button type="button" className="btn-close" onClick={close}>
+              Close
+            </button>
           </div>
+        </header>
 
-          <div className="form-row-2">
-            <div className="admin-field">
-              <label>Phone Number</label>
-              <input value={formData.phone_number} onChange={e => handleChange('phone_number', e.target.value)} required />
-            </div>
-            <div className="admin-field">
-              <label>Alternate Number</label>
-              <input value={formData.alternate_number} onChange={e => handleChange('alternate_number', e.target.value)} />
-            </div>
-          </div>
-
-          <div className="form-row-2">
-            <div className="admin-field">
-              <label>Address</label>
-              <input value={formData.customer_address} onChange={e => handleChange('customer_address', e.target.value)} required />
-            </div>
-            <div className="admin-field">
-              <label>Pincode</label>
-              <input value={formData.pincode} onChange={e => handleChange('pincode', e.target.value)} required />
-            </div>
-          </div>
-
-          <div className="admin-field">
-            <label>Issue Category</label>
-            <input value={formData.issue_category} onChange={e => handleChange('issue_category', e.target.value)} required />
-          </div>
-
-          <div className="admin-field">
-            <label>Detailed Description</label>
-            <textarea rows={3} value={formData.detailed_description} onChange={e => handleChange('detailed_description', e.target.value)} required />
-          </div>
-
-          <div className="modal-action-bar">
-            <button type="submit" className="btn-save">Save Changes</button>
-            {isMoved ? (
-              <button type="button" className="btn-move btn-moved" disabled title="This submission has already been moved to cases.">
-                ✓ Moved to Cases {value.case_id ? `(${value.case_id})` : ''}
-              </button>
-            ) : (
-              <button type="button" className="btn-move" onClick={onMove}>Move to Cases</button>
-            )}
-          </div>
-        </form>
-
-        {/* Right column: CRM matched details & Case info */}
-        <div className="admin-side-info">
-          {/* Matched CRM Information */}
-          <div className="admin-info-card">
-            <div className="card-header">
-              <h3>Matched CRM Order Details</h3>
-              <span className={`status-badge ${value.crm_status === 'Order ID Exists' ? 'badge-crm-ok' : 'badge-crm-missing'}`}>{value.crm_status}</span>
-            </div>
-            {value.crm ? (
-              <div className="info-kv-grid">
-                <div><span>CX Name</span><strong>{crm.cx_name || '—'}</strong></div>
-                <div><span>Account Name</span><strong>{crm.account_name || '—'}</strong></div>
-                <div><span>Product Type</span><strong>{crm.product_type || '—'}</strong></div>
-                <div><span>Product Name</span><strong>{crm.product_name || value.crm_product_name || '—'}</strong></div>
-                <div><span>Order Date</span><strong>{crm.order_date || '—'}</strong></div>
-                <div><span>Place of Supply</span><strong>{crm.place_of_supply || '—'}</strong></div>
-                <div><span>Purchased Product</span><strong>{crm.purchased_product || value.crm_purchased_product || '—'}</strong></div>
-                <div><span>SKU</span><strong>{crm.sku_new || value.crm_sku_new || '—'}</strong></div>
-              </div>
-            ) : (
-              <p className="not-found-note">No matching CRM record found for Order ID "{formData.order_id}".</p>
-            )}
-          </div>
-
-          {/* Existing Case Information */}
-          <div className="admin-info-card">
-            <div className="card-header">
-              <h3>Existing Cases in Database</h3>
-              <span className="card-badge">Durafit Cases</span>
-            </div>
-            {value.case_id && (
-              <div className="portal-case-callout">
-                <span>Created Case ID:</span>
-                <strong>{value.case_id}</strong>
+        {(saveStatus || moveMessage) && (
+          <div style={{ padding: '8px 24px 0', flexShrink: 0 }}>
+            {saveStatus && (
+              <div className={`modal-alert ${saveStatus.includes('failed') || saveStatus.includes('Error') ? 'alert-danger' : 'alert-success'}`} style={{ marginBottom: '6px' }}>
+                {saveStatus}
               </div>
             )}
-            <div className="case-status-tags">
-              {value.case_statuses?.map((st, i) => (
-                <span key={i} className="status-badge case-pill">{st}</span>
-              ))}
-            </div>
+            {moveMessage && (
+              <div className="modal-alert alert-info" style={{ marginBottom: '6px' }}>
+                {moveMessage}
+              </div>
+            )}
           </div>
+        )}
 
-          {/* Invoice & Attachments */}
-          <div className="admin-info-card">
+        {/* 4. BODY — 3-Column Grid (35% 30% 35%) with 3 Separate Direct Grid Children */}
+        <div
+          className="verification-modal-body"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '35% 30% 35%',
+            height: '100%',
+            minHeight: 0,
+            flex: 1,
+            overflow: 'hidden',
+          }}
+        >
+          {/* DIRECT GRID CHILD 1 — COLUMN 1 (35%): CASE DETAILS — READY TO MOVE TO CASES */}
+          <form
+            onSubmit={handleSubmit}
+            className="verification-column-1"
+            style={{
+              height: '100%',
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: '18px 20px',
+              borderRight: '1px solid #e0ebe6',
+              background: '#fbfdfc',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+            }}
+          >
             <div className="card-header">
-              <h3>Invoice & Attachments</h3>
-              <span className="card-badge">{value.attachments?.length || 0} files</span>
+              <h3>CASE DETAILS — READY TO MOVE TO CASES</h3>
+              <span className="card-badge">Case Schema</span>
             </div>
-            <div className="attachment-list">
-              {value.attachments?.length ? value.attachments.map(a => (
-                <button key={a.attachment_id} type="button" className="attachment-chip" onClick={() => download(a)}>
-                  📎 {a.attachment_kind}: {a.original_filename}
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>1. Case ID</label>
+                <input
+                  value={formData.case_id}
+                  onChange={e => handleChange('case_id', e.target.value)}
+                  readOnly={isMoved}
+                />
+              </div>
+              <div className="admin-field">
+                <label>2. Order ID</label>
+                <input
+                  value={formData.order_id}
+                  onChange={e => handleChange('order_id', e.target.value)}
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>3. Customer</label>
+                <input
+                  value={formData.full_name}
+                  onChange={e => handleChange('full_name', e.target.value)}
+                  required
+                />
+              </div>
+              <div className="admin-field">
+                <label>4. Mobile</label>
+                <input
+                  value={formData.phone_number}
+                  onChange={e => handleChange('phone_number', e.target.value)}
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>5. SKU</label>
+                <input
+                  value={formData.sku}
+                  onChange={e => handleChange('sku', e.target.value)}
+                  placeholder="Enter SKU manually if CRM not found"
+                />
+              </div>
+              <div className="admin-field">
+                <label>6. Product</label>
+                <input
+                  value={formData.product}
+                  onChange={e => handleChange('product', e.target.value)}
+                  placeholder="Enter Product manually if CRM not found"
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>7. Case Type</label>
+                <input
+                  value={formData.case_type}
+                  onChange={e => handleChange('case_type', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>8. Status</label>
+                <input
+                  value={formData.status}
+                  onChange={e => handleChange('status', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>9. Spares</label>
+                <input
+                  value={formData.spares}
+                  onChange={e => handleChange('spares', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>10. Comment</label>
+                <input
+                  value={formData.comment}
+                  onChange={e => handleChange('comment', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>11. SO Owner</label>
+                <input
+                  value={formData.so_owner}
+                  onChange={e => handleChange('so_owner', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>12. Welcome Call Agent</label>
+                <input
+                  value={formData.welcome_call_agent}
+                  onChange={e => handleChange('welcome_call_agent', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>13. Created By</label>
+                <input
+                  value={formData.created_by}
+                  onChange={e => handleChange('created_by', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>14. Created Date</label>
+                <input
+                  type="date"
+                  value={formData.created_date}
+                  onChange={e => handleChange('created_date', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>15. Closed Date</label>
+                <input
+                  type="date"
+                  value={formData.closed_date}
+                  onChange={e => handleChange('closed_date', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>16. Visit Status</label>
+                <input
+                  value={formData.visit_status}
+                  onChange={e => handleChange('visit_status', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>17. Amount Charged</label>
+                <input
+                  value={formData.amount_charged}
+                  onChange={e => handleChange('amount_charged', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>18. Amount to Tech</label>
+                <input
+                  value={formData.amount_to_tech}
+                  onChange={e => handleChange('amount_to_tech', e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="admin-field">
+              <label>19. Technician Resolution</label>
+              <textarea
+                rows={2}
+                value={formData.technician_resolution}
+                onChange={e => handleChange('technician_resolution', e.target.value)}
+              />
+            </div>
+
+            <div
+              className="submission-section-divider"
+              style={{
+                margin: '8px 0 4px',
+                padding: '6px 10px',
+                background: '#eef5f2',
+                borderLeft: '3px solid #0f352d',
+                fontWeight: 700,
+                fontSize: '12px',
+                color: '#0f352d',
+                letterSpacing: '0.04em',
+              }}
+            >
+              --- CUSTOMER SUBMISSION DETAILS ---
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>20. Alternate Number</label>
+                <input
+                  value={formData.alternate_number}
+                  onChange={e => handleChange('alternate_number', e.target.value)}
+                />
+              </div>
+              <div className="admin-field">
+                <label>21. Address</label>
+                <input
+                  value={formData.customer_address}
+                  onChange={e => handleChange('customer_address', e.target.value)}
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="form-row-2">
+              <div className="admin-field">
+                <label>22. Pincode</label>
+                <input
+                  value={formData.pincode}
+                  onChange={e => handleChange('pincode', e.target.value)}
+                  required
+                />
+              </div>
+              <div className="admin-field">
+                <label>23. Issue Category</label>
+                <input
+                  value={formData.issue_category}
+                  onChange={e => {
+                    const val = e.target.value
+                    setFormData(prev => ({
+                      ...prev,
+                      issue_category: val,
+                      case_type: prev.case_type === prev.issue_category ? val : prev.case_type,
+                    }))
+                  }}
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="admin-field" style={{ display: 'flex', flexDirection: 'column' }}>
+              <label>24. Detailed Description</label>
+              <textarea
+                rows={3}
+                style={{ minHeight: '72px' }}
+                value={formData.detailed_description}
+                onChange={e => {
+                  const val = e.target.value
+                  setFormData(prev => ({
+                    ...prev,
+                    detailed_description: val,
+                    comment: prev.comment === prev.detailed_description ? val : prev.comment,
+                  }))
+                }}
+                required
+              />
+            </div>
+
+            <div className="modal-action-bar" style={{ marginTop: 'auto', position: 'sticky', bottom: 0, background: '#fbfdfc', paddingTop: '10px', borderTop: '1px solid #e0ebe6' }}>
+              <button type="submit" className="btn-save">Save Changes</button>
+              {isMoved ? (
+                <button type="button" className="btn-move btn-moved" disabled title="This submission has already been moved to cases.">
+                  ✓ Moved to Cases {value.case_id ? `(${value.case_id})` : ''}
                 </button>
-              )) : <p className="not-found-note">No attachments provided.</p>}
+              ) : (
+                <button type="button" className="btn-move" onClick={handleMoveClick}>Move to Cases</button>
+              )}
+            </div>
+          </form>
+
+          {/* DIRECT GRID CHILD 2 — COLUMN 2 (30%): Matched CRM Order Details + Existing Cases in Database */}
+          <div
+            className="verification-column-2"
+            style={{
+              height: '100%',
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: '18px 20px',
+              borderRight: '1px solid #e0ebe6',
+              background: '#f7faf8',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '16px',
+            }}
+          >
+            <div className="admin-info-card">
+              <div className="card-header">
+                <h3>Matched CRM Order Details</h3>
+                <span className={`status-badge ${value.crm_status === 'Order ID Exists' ? 'badge-crm-ok' : 'badge-crm-missing'}`}>{value.crm_status}</span>
+              </div>
+              {value.crm ? (
+                <div className="info-kv-grid">
+                  <div><span>CX Name</span><strong>{crm.cx_name || '—'}</strong></div>
+                  <div><span>Account Name</span><strong>{crm.account_name || '—'}</strong></div>
+                  <div><span>Product Type</span><strong>{crm.product_type || '—'}</strong></div>
+                  <div><span>Product Name</span><strong>{crm.product_name || value.crm_product_name || '—'}</strong></div>
+                  <div><span>Order Date</span><strong>{crm.order_date || '—'}</strong></div>
+                  <div><span>Place of Supply</span><strong>{crm.place_of_supply || '—'}</strong></div>
+                  <div><span>Purchased Product</span><strong>{crm.purchased_product || value.crm_purchased_product || '—'}</strong></div>
+                  <div><span>SKU</span><strong>{crm.sku_new || value.crm_sku_new || '—'}</strong></div>
+                </div>
+              ) : (
+                <p className="not-found-note">No matching CRM record found for Order ID &quot;{formData.order_id}&quot;.</p>
+              )}
+            </div>
+
+            <div className="admin-info-card">
+              <div className="card-header">
+                <h3>Existing Cases in Database</h3>
+                <span className="card-badge">Durafit Cases</span>
+              </div>
+              {value.case_id && (
+                <div className="portal-case-callout">
+                  <span>Case ID:</span>
+                  <strong>{value.case_id}</strong>
+                </div>
+              )}
+              <div className="case-status-tags">
+                {value.case_statuses?.map((st, i) => (
+                  <span key={i} className="status-badge case-pill">{st}</span>
+                ))}
+              </div>
             </div>
           </div>
+
+          {/* DIRECT GRID CHILD 3 — COLUMN 3 (35%): Customer Invoice & Attachments + Large Invoice Preview */}
+          <div
+            className="verification-column-3"
+            style={{
+              height: '100%',
+              minHeight: 0,
+              overflow: 'hidden',
+              padding: '18px 20px',
+              background: '#ffffff',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}
+          >
+            <div className="card-header" style={{ flexShrink: 0 }}>
+              <h3>Customer Invoice &amp; Attachments</h3>
+              <span className="card-badge">{attachments.length} files</span>
+            </div>
+
+            <div className="attachment-list" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: 0, flexShrink: 0 }}>
+              {attachments.length ? attachments.map(a => {
+                const isActive = activeAttachment && activeAttachment.attachment_id === a.attachment_id
+                return (
+                  <button
+                    key={a.attachment_id}
+                    type="button"
+                    className={`attachment-chip ${a.attachment_kind === 'invoice_image' ? 'attachment-chip-invoice' : ''} ${isActive ? 'attachment-chip-selected' : ''}`}
+                    onClick={() => setSelectedAttachment(a)}
+                  >
+                    📎 {a.attachment_kind}: {a.original_filename}
+                  </button>
+                )
+              }) : <p className="not-found-note">No attachments provided.</p>}
+            </div>
+
+            <InvoicePreview
+              submissionId={value.submission_id}
+              submissionValue={value}
+              invoice={activeAttachment}
+              token={token}
+              onDownload={download}
+            />
+          </div>
         </div>
+      </section>
+    </div>,
+    document.body
+  )
+}
+
+function InvoicePreview({ submissionId, submissionValue, invoice, token, onDownload }) {
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [previewType, setPreviewType] = useState('image')
+  const [previewError, setPreviewError] = useState('')
+
+  useEffect(() => {
+    if (!invoice) {
+      setPreviewUrl('')
+      setPreviewError('No invoice or attachment is available for this submission.')
+      return undefined
+    }
+    let active = true
+    let objectUrl = ''
+    setPreviewUrl('')
+    setPreviewError('Loading invoice preview…')
+    request(`/api/admin/customer-submissions/${submissionId}/attachments/${invoice.attachment_id}`, token)
+      .then(async response => {
+        if (!response.ok) throw new Error('Attachment is unavailable.')
+        const rawBlob = await response.blob()
+        const buf = await rawBlob.arrayBuffer()
+        const bytes = new Uint8Array(buf)
+        const isPng = bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+        const isJpg = bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF
+        const isGif = bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+        const isWebp = bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+        const isPdf = bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46
+
+        if (isPng || isJpg || isGif || isWebp) {
+          const mime = isPng ? 'image/png' : isJpg ? 'image/jpeg' : isGif ? 'image/gif' : 'image/webp'
+          objectUrl = URL.createObjectURL(new Blob([buf], { type: mime }))
+          if (active) {
+            setPreviewType('image')
+            setPreviewUrl(objectUrl)
+            setPreviewError('')
+          }
+        } else if (isPdf || invoice.content_type === 'application/pdf') {
+          objectUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }))
+          if (active) {
+            setPreviewType('pdf')
+            setPreviewUrl(objectUrl)
+            setPreviewError('')
+          }
+        } else {
+          const textContent = new TextDecoder().decode(bytes.slice(0, 120))
+          const svgText = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1040" viewBox="0 0 800 1040">
+            <rect width="800" height="1040" fill="#ffffff"/>
+            <rect x="32" y="32" width="736" height="976" rx="12" fill="#fbfdfc" stroke="#c8ddd5" stroke-width="2"/>
+            <rect x="32" y="32" width="736" height="96" rx="12" fill="#0f352d"/>
+            <text x="64" y="88" font-family="Arial, sans-serif" font-size="24" font-weight="bold" fill="#ffffff">DURAFIT91 INVOICE PREVIEW — ${String(invoice.original_filename || '').replace(/[&<>'"]/g, '')}</text>
+            <text x="64" y="180" font-family="Arial, sans-serif" font-size="18" fill="#173830"><tspan font-weight="bold">Order ID:</tspan> ${String(submissionValue?.order_id || '').replace(/[&<>'"]/g, '')}</text>
+            <text x="64" y="220" font-family="Arial, sans-serif" font-size="18" fill="#173830"><tspan font-weight="bold">Customer:</tspan> ${String(submissionValue?.full_name || '').replace(/[&<>'"]/g, '')}</text>
+            <text x="64" y="260" font-family="Arial, sans-serif" font-size="18" fill="#173830"><tspan font-weight="bold">Phone:</tspan> ${String(submissionValue?.phone_number || '').replace(/[&<>'"]/g, '')}</text>
+            <text x="64" y="300" font-family="Arial, sans-serif" font-size="18" fill="#173830"><tspan font-weight="bold">Attachment:</tspan> ${String(invoice.attachment_kind || '').replace(/[&<>'"]/g, '')} (${String(invoice.original_filename || '').replace(/[&<>'"]/g, '')})</text>
+            <text x="64" y="350" font-family="Arial, sans-serif" font-size="15" fill="#526b64">${String(textContent || '').replace(/[&<>'"]/g, '')}</text>
+          </svg>`
+          if (active) {
+            setPreviewType('image')
+            setPreviewUrl(`data:image/svg+xml;utf8,${encodeURIComponent(svgText)}`)
+            setPreviewError('')
+          }
+        }
+      })
+      .catch(error => active && setPreviewError(error.message || 'Attachment is unavailable.'))
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [submissionId, invoice?.attachment_id, token])
+
+  if (!invoice) return <p className="invoice-preview-message">No invoice was uploaded.</p>
+  return (
+    <div
+      className="invoice-preview"
+      style={{
+        flex: 1,
+        minHeight: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        border: '1px solid #cfdfd9',
+        borderRadius: '10px',
+        overflow: 'hidden',
+        background: '#1c2624',
+      }}
+    >
+      <div
+        className="invoice-preview-title"
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          padding: '8px 14px',
+          background: '#12221e',
+          color: '#e6f2ee',
+          fontSize: '12px',
+          flexShrink: 0,
+        }}
+      >
+        <span>
+          <strong>{invoice.attachment_kind === 'invoice_image' ? 'Invoice' : invoice.attachment_kind}:</strong> {invoice.original_filename}
+        </span>
+        {onDownload && (
+          <button
+            type="button"
+            onClick={() => onDownload(invoice)}
+            style={{
+              background: '#197a5c',
+              color: '#fff',
+              border: 0,
+              borderRadius: '5px',
+              padding: '4px 10px',
+              fontSize: '11px',
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            Download
+          </button>
+        )}
       </div>
-    </section>
+      <div
+        className="invoice-preview-frame"
+        style={{
+          flex: 1,
+          minHeight: 0,
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          overflow: 'auto',
+          padding: '10px',
+        }}
+      >
+        {previewUrl && previewType === 'image' && (
+          <img
+            src={previewUrl}
+            alt={`Preview of ${invoice.original_filename}`}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain',
+              background: '#ffffff',
+              borderRadius: '6px',
+            }}
+          />
+        )}
+        {previewUrl && previewType === 'pdf' && (
+          <iframe
+            src={previewUrl}
+            title={`Preview of ${invoice.original_filename}`}
+            style={{
+              width: '100%',
+              height: '100%',
+              border: 0,
+              background: '#ffffff',
+              borderRadius: '6px',
+            }}
+          />
+        )}
+        {!previewUrl && (
+          <p className="invoice-preview-message" style={{ color: '#d5e5e0' }}>
+            {previewError}
+          </p>
+        )}
+      </div>
+    </div>
   )
 }
 

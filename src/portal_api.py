@@ -3,11 +3,12 @@
 from contextlib import asynccontextmanager
 
 import mysql.connector
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.portal_db import close_pool, find_order
+from src.portal_email import send_test_acknowledgement_email
 from src.portal_models import OrderLookupResponse, SubmissionResponse, SubmissionUpdateRequest
 from src.portal_submissions import create_submission
 from src.admin_auth import authenticate, require_admin, revoke
@@ -28,9 +29,15 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Durafit91 Customer Portal API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "https://durafit91-portal.onrender.com"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "https://durafit91-portal.onrender.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -117,11 +124,29 @@ def put_customer_submission(submission_id: str, body: SubmissionUpdateRequest, _
 
 
 @app.post("/api/admin/customer-submissions/{submission_id}/move-to-cases")
-def move_submission_to_cases(submission_id: str, admin: str = Depends(require_admin)) -> dict:
-    result = admin_move_submission_to_cases(submission_id, admin_user=admin)
+def move_submission_to_cases(
+    submission_id: str,
+    case_fields: dict | None = Body(default=None),
+    admin: str = Depends(require_admin),
+) -> dict:
+    result = admin_move_submission_to_cases(submission_id, admin_user=admin, case_fields=case_fields)
     if result is None:
         raise HTTPException(status_code=404, detail="Customer submission not found")
     return result
+
+
+@app.post("/api/admin/test-acknowledgement-email")
+def trigger_test_acknowledgement_email(
+    recipient_email: str = Body(..., embed=True),
+    customer_name: str = Body("Test Customer", embed=True),
+    _: str = Depends(require_admin),
+) -> dict:
+    try:
+        return send_test_acknowledgement_email(recipient_email=recipient_email, customer_name=customer_name)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
 
 
 @app.get("/api/admin/customer-submissions/{submission_id}/attachments/{attachment_id}")
@@ -169,14 +194,16 @@ def get_order(order_id: str) -> OrderLookupResponse:
 @app.post("/api/submissions", response_model=SubmissionResponse)
 async def submit_request(
     idempotency_key: str = Form(...), full_name: str = Form(...), phone: str = Form(...),
+    email: str = Form(""), email_address: str = Form(""), customer_email: str = Form(""),
     alternate_number: str = Form(""), order_id: str = Form(...), customer_address: str = Form(...),
     state: str | None = Form(None), pincode: str = Form(...), issue_category: str = Form(...), subject: str | None = Form(None),
     description: str = Form(...), invoice_image: UploadFile = File(...), attachments: list[UploadFile] = File(default=[]),
 ) -> SubmissionResponse:
-    fields = {"full_name": full_name.strip(), "phone": phone.strip(), "alternate_number": alternate_number.strip(),
+    resolved_email = (email or email_address or customer_email or "").strip()
+    fields = {"full_name": full_name.strip(), "email": resolved_email, "phone": phone.strip(), "alternate_number": alternate_number.strip(),
               "order_id": order_id.strip(), "customer_address": customer_address.strip(), "state": state.strip() if state else None,
               "pincode": pincode.strip(), "issue_category": issue_category.strip(), "subject": subject.strip() if subject else None, "description": description.strip()}
-    if any(not value for key, value in fields.items() if key not in {"alternate_number", "state", "subject"}):
+    if any(not value for key, value in fields.items() if key not in {"email", "alternate_number", "state", "subject"}):
         raise HTTPException(status_code=422, detail="All required fields must be provided")
     try:
         result = await create_submission(fields, invoice_image, attachments, idempotency_key)
@@ -185,3 +212,35 @@ async def submit_request(
     except mysql.connector.Error:
         raise HTTPException(status_code=503, detail="Submission service is temporarily unavailable")
     return SubmissionResponse(success=True, submission_id=result["submission_id"], case_id=result.get("case_id"), status=result["status"], message="Your service request has been submitted successfully.")
+
+
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIST = _Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if (_FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets")), name="frontend_assets")
+
+
+@app.get("/durafit91-logo.png", include_in_schema=False)
+def _serve_logo():
+    logo_file = _FRONTEND_DIST / "durafit91-logo.png"
+    if logo_file.is_file():
+        return FileResponse(logo_file)
+    pub_logo = _Path(__file__).resolve().parent.parent / "frontend" / "public" / "durafit91-logo.png"
+    if pub_logo.is_file():
+        return FileResponse(pub_logo)
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/admin", include_in_schema=False)
+@app.get("/admin/{subpath:path}", include_in_schema=False)
+@app.get("/customer-portal", include_in_schema=False)
+@app.get("/customer-case", include_in_schema=False)
+def _serve_frontend_spa(subpath: str = ""):
+    index_file = _FRONTEND_DIST / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+    raise HTTPException(status_code=404, detail="Frontend build not found")
+

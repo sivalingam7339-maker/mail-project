@@ -11,11 +11,12 @@ import mysql.connector
 from openpyxl import load_workbook
 
 from src.import_excel_databases import cell_text, find_order_id_column, row_hash
-from src.portal_db import mysql_options
+from src.portal_db import mysql_options, portal_database_name, source_database_name
 
 
 def _now(): return datetime.now(timezone.utc).replace(tzinfo=None)
 def _quote(name): return "`" + name.replace("`", "``") + "`"
+def _portal_table(name): return f"{_quote(portal_database_name())}.{_quote(name)}"
 BATCH_SIZE = 500
 
 
@@ -69,7 +70,7 @@ def _row_values(raw, source_headers: list[str], target_headers: list[str], crm: 
 
 
 def _history(cursor, import_id, kind, filename, now):
-    cursor.execute("INSERT INTO `durafit_portal`.`portal_import_history` (import_id,import_type,original_filename,started_at,status,created_at) VALUES (%s,%s,%s,%s,'running',%s)", (import_id.bytes,kind,filename[:255],now,now))
+    cursor.execute(f"INSERT INTO {_portal_table('portal_import_history')} (import_id,import_type,original_filename,started_at,status,created_at) VALUES (%s,%s,%s,%s,'running',%s)", (import_id.bytes,kind,filename[:255],now,now))
 
 
 def _chunks(values, size=BATCH_SIZE):
@@ -169,7 +170,7 @@ def _import_cases_batch(cursor, conn, insert, rows, summary):
 def import_xlsx(kind: str, filename: str, content: bytes) -> dict:
     if kind not in {"crm", "cases"}: raise ValueError("Unknown import type")
     if not filename.lower().endswith(".xlsx"): raise ValueError("Only .xlsx files are accepted")
-    database, table = ("durafit_crm", "crm_records") if kind == "crm" else ("durafit_cases", "case_records")
+    database, table = (source_database_name("crm"), "crm_records") if kind == "crm" else (source_database_name("cases"), "case_records")
     import_id, now = uuid.uuid4(), _now(); summary = {"import_id": str(import_id), "import_type": kind, "total_rows": 0, "inserted_rows": 0, "skipped_rows": 0, "failed_rows": 0, "status": "completed", "error_summary": None}
     options = mysql_options(database=database, pool=False); conn = mysql.connector.connect(**options)
     book = None
@@ -198,7 +199,7 @@ def import_xlsx(kind: str, filename: str, content: bytes) -> dict:
         if book: book.close()
         summary["status"] = "failed"; summary["error_summary"] = str(error)[:2000]
     finally:
-        cursor = conn.cursor(); cursor.execute("UPDATE `durafit_portal`.`portal_import_history` SET completed_at=%s,total_rows=%s,inserted_rows=%s,skipped_rows=%s,failed_rows=%s,status=%s,error_summary=%s WHERE import_id=%s", (_now(),summary["total_rows"],summary["inserted_rows"],summary["skipped_rows"],summary["failed_rows"],summary["status"],summary["error_summary"],import_id.bytes)); conn.commit(); conn.close()
+        cursor = conn.cursor(); cursor.execute(f"UPDATE {_portal_table('portal_import_history')} SET completed_at=%s,total_rows=%s,inserted_rows=%s,skipped_rows=%s,failed_rows=%s,status=%s,error_summary=%s WHERE import_id=%s", (_now(),summary["total_rows"],summary["inserted_rows"],summary["skipped_rows"],summary["failed_rows"],summary["status"],summary["error_summary"],import_id.bytes)); conn.commit(); conn.close()
     summary["source_sheet"] = "Sales Order" if kind == "crm" and summary["status"] == "completed" else None
     return summary
 
@@ -206,7 +207,7 @@ def import_xlsx(kind: str, filename: str, content: bytes) -> dict:
 def dry_run(kind: str, content: bytes) -> dict:
     """Validate and classify an upload without any write to MySQL."""
     if kind not in {"crm", "cases"}: raise ValueError("Unknown import type")
-    database, table = ("durafit_crm", "crm_records") if kind == "crm" else ("durafit_cases", "case_records")
+    database, table = (source_database_name("crm"), "crm_records") if kind == "crm" else (source_database_name("cases"), "case_records")
     book, source_sheet, source_headers, rows = _workbook_rows(content, "Sales Order" if kind == "crm" else None)
     try:
         find_order_id_column(source_headers)
@@ -244,7 +245,7 @@ def dry_run(kind: str, content: bytes) -> dict:
 
 
 def customer_cases(page=1, page_size=25, search='', crm_status='all', case_status='all'):
-    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    conn=mysql.connector.connect(**mysql_options(database=portal_database_name(),pool=False));cur=conn.cursor(dictionary=True)
     try:
         where=[];params=[]
         if search:
@@ -274,13 +275,28 @@ def customer_cases(page=1, page_size=25, search='', crm_status='all', case_statu
     finally:cur.close();conn.close()
 
 
+def _default_comment_from_submission(item: dict) -> str:
+    comment_parts = []
+    desc = (item.get("detailed_description") or "").strip()
+    if desc:
+        comment_parts.append(desc)
+    addr_parts = []
+    if item.get("customer_address"):
+        addr_parts.append(f"Address: {item['customer_address'].strip()}")
+    if item.get("pincode"):
+        addr_parts.append(f"Pincode: {item['pincode'].strip()}")
+    if addr_parts:
+        comment_parts.append(", ".join(addr_parts))
+    return "\n".join(comment_parts)
+
+
 def customer_case_detail(submission_id: str) -> dict | None:
     """Read one application-owned submission and its private attachment metadata."""
     try: submission = uuid.UUID(submission_id)
     except ValueError: return None
-    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    conn=mysql.connector.connect(**mysql_options(database=portal_database_name(),pool=False));cur=conn.cursor(dictionary=True)
     try:
-        cur.execute("""SELECT BIN_TO_UUID(s.submission_id) submission_id,s.created_at,s.full_name,s.phone_number,s.alternate_number,s.order_id,s.customer_address,s.pincode,s.issue_category,s.detailed_description,s.submission_status,s.crm_product_name,s.crm_purchased_product,s.crm_sku_new,s.crm_customer_name,s.crm_mobile_number,s.crm_customer_email,p.case_id,p.case_status
+        cur.execute("""SELECT BIN_TO_UUID(s.submission_id) submission_id,s.created_at,s.full_name,s.phone_number,s.alternate_number,s.order_id,s.customer_address,s.pincode,s.issue_category,s.detailed_description,s.submission_status,s.crm_product_name,s.crm_purchased_product,s.crm_sku_new,s.crm_customer_name,s.crm_mobile_number,s.crm_customer_email,s.crm_sales_order_owner,p.case_id,p.case_status
         FROM portal_submissions s LEFT JOIN portal_cases p ON p.submission_id=s.submission_id WHERE s.submission_id=%s""", (submission.bytes,))
         item=cur.fetchone()
         if not item: return None
@@ -289,11 +305,67 @@ def customer_case_detail(submission_id: str) -> dict | None:
         # details view also reads this small, explicit set of current CRM fields.
         cur.execute("""SELECT `Name` AS cx_name,`Account Name` AS account_name,`Product Type` AS product_type,
             `Product Name` AS product_name,`Order Date` AS order_date,`Place of Supply` AS place_of_supply,
-            `Purchased Product` AS purchased_product,`SKU new` AS sku_new
+            `Purchased Product` AS purchased_product,`SKU new` AS sku_new,`Sales Order Owner` AS so_owner,
+            `Mobile Number` AS mobile_number,`Customer Email` AS customer_email
             FROM `durafit_crm`.`crm_records` WHERE `Order ID`=%s LIMIT 1""",(item['order_id'],))
-        item['crm']=cur.fetchone()
-        item['crm_status']='Order ID Exists' if item['crm'] else 'Order ID Not Found'
-        cur.execute("SELECT `Status` FROM `durafit_cases`.`case_records` WHERE `Order ID`=%s",(item['order_id'],));item['case_statuses']=[r['Status'] or 'Not Available' for r in cur.fetchall()] or ['Need to Create Case']
+        crm = cur.fetchone()
+        item['crm'] = crm
+        item['crm_status'] = 'Order ID Exists' if crm else 'Order ID Not Found'
+        cur.execute("""SELECT `Order ID` AS order_id, `Customer` AS customer, `Mobile` AS mobile, `SKU` AS sku,
+            `Product` AS product, `Case Type` AS case_type, `Status` AS status, `Spares` AS spares,
+            `Comment` AS comment, `SO Owner` AS so_owner, `Welcome Call Agent` AS welcome_call_agent,
+            `Created By` AS created_by, `Created Date` AS created_date, `Closed Date` AS closed_date,
+            `Amount Charged` AS amount_charged, `Amount to Tech` AS amount_to_tech,
+            `Visit Status` AS visit_status, `Technician Resolution` AS technician_resolution
+            FROM `durafit_cases`.`case_records` WHERE `Order ID`=%s""",(item['order_id'],))
+        existing_cases = cur.fetchall()
+        item['existing_cases'] = existing_cases
+        item['case_statuses'] = [r['status'] or 'Not Available' for r in existing_cases] or ['Need to Create Case']
+        cur.execute("""SELECT event_payload FROM portal_submission_events
+            WHERE submission_id=%s AND event_type='submission_edited_by_admin'
+            ORDER BY created_at DESC LIMIT 1""", (submission.bytes,))
+        ev = cur.fetchone()
+        saved_draft = {}
+        if ev and ev.get('event_payload'):
+            try:
+                raw_payload = ev['event_payload']
+                parsed_payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                saved_draft = parsed_payload.get('case_draft') or {}
+            except Exception:
+                saved_draft = {}
+
+        default_case_id = item.get('case_id') or f"DF91-CASE-{datetime.now():%Y%m%d}-{submission.hex[:4].upper()}"
+        default_sku = (crm.get('sku_new') if crm else None) or item.get('crm_sku_new') or ''
+        default_product = (crm.get('purchased_product') if crm else None) or item.get('crm_purchased_product') or (crm.get('product_name') if crm else None) or item.get('crm_product_name') or ''
+        default_so_owner = (crm.get('so_owner') if crm else None) or item.get('crm_sales_order_owner') or ''
+        default_comment = _default_comment_from_submission(item)
+
+        def _pick(key: str, fallback: str) -> str:
+            if key in saved_draft and saved_draft[key] is not None and str(saved_draft[key]).strip() != "":
+                return str(saved_draft[key]).strip()
+            return str(fallback or "").strip()
+
+        item['case_draft'] = {
+            "case_id": _pick("case_id", default_case_id),
+            "order_id": _pick("order_id", item.get("order_id") or ""),
+            "customer": _pick("customer", item.get("full_name") or ""),
+            "mobile": _pick("mobile", item.get("phone_number") or ""),
+            "sku": _pick("sku", default_sku),
+            "product": _pick("product", default_product),
+            "case_type": _pick("case_type", item.get("issue_category") or "Product Issue (Warranty)"),
+            "status": _pick("status", "Open"),
+            "spares": _pick("spares", ""),
+            "comment": _pick("comment", default_comment),
+            "so_owner": _pick("so_owner", default_so_owner),
+            "welcome_call_agent": _pick("welcome_call_agent", ""),
+            "created_by": _pick("created_by", "Customer Portal"),
+            "created_date": _pick("created_date", datetime.now().strftime("%Y-%m-%d")),
+            "closed_date": _pick("closed_date", ""),
+            "visit_status": _pick("visit_status", "Pending"),
+            "amount_charged": _pick("amount_charged", "0"),
+            "amount_to_tech": _pick("amount_to_tech", "0"),
+            "technician_resolution": _pick("technician_resolution", ""),
+        }
         return item
     finally: cur.close();conn.close()
 
@@ -302,14 +374,14 @@ def attachment_path(submission_id: str, attachment_id: str):
     """Resolve a private attachment only after its submission relationship is checked."""
     try: submission=uuid.UUID(submission_id); attachment=uuid.UUID(attachment_id)
     except ValueError: return None
-    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    conn=mysql.connector.connect(**mysql_options(database=portal_database_name(),pool=False));cur=conn.cursor(dictionary=True)
     try:
         cur.execute("SELECT storage_key,original_filename,content_type FROM portal_submission_attachments WHERE submission_id=%s AND attachment_id=%s",(submission.bytes,attachment.bytes));return cur.fetchone()
     finally: cur.close();conn.close()
 
 
 def stats_and_history(limit=50):
-    options = mysql_options(database="durafit_portal", pool=False); conn = mysql.connector.connect(**options); cur = conn.cursor(dictionary=True)
+    options = mysql_options(database=portal_database_name(), pool=False); conn = mysql.connector.connect(**options); cur = conn.cursor(dictionary=True)
     try:
         cur.execute("SELECT COUNT(*) AS value FROM `durafit_crm`.`crm_records`"); crm = cur.fetchone()["value"]
         cur.execute("SELECT COUNT(*) AS value FROM `durafit_cases`.`case_records`"); cases = cur.fetchone()["value"]
@@ -340,14 +412,14 @@ def stats_and_history(limit=50):
 
 
 def history(limit=50):
-    options=mysql_options(database="durafit_portal",pool=False); conn=mysql.connector.connect(**options); cur=conn.cursor(dictionary=True)
+    options=mysql_options(database=portal_database_name(),pool=False); conn=mysql.connector.connect(**options); cur=conn.cursor(dictionary=True)
     try:
         cur.execute("SELECT BIN_TO_UUID(import_id) AS import_id,import_type,original_filename,started_at,completed_at,total_rows,inserted_rows,skipped_rows,failed_rows,status,error_summary FROM portal_import_history ORDER BY created_at DESC LIMIT %s", (min(max(limit,1),100),)); return cur.fetchall()
     finally: cur.close();conn.close()
 
 
 def customer_submissions(page=1, page_size=25, search='', crm_status='all', case_status='all', submission_status='all'):
-    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    conn=mysql.connector.connect(**mysql_options(database=portal_database_name(),pool=False));cur=conn.cursor(dictionary=True)
     try:
         where=[];params=[]
         if search:
@@ -394,7 +466,7 @@ def customer_submissions(page=1, page_size=25, search='', crm_status='all', case
 def update_customer_submission(submission_id: str, fields: dict) -> dict | None:
     try: submission = uuid.UUID(submission_id)
     except ValueError: return None
-    conn=mysql.connector.connect(**mysql_options(database='durafit_portal',pool=False));cur=conn.cursor(dictionary=True)
+    conn=mysql.connector.connect(**mysql_options(database=portal_database_name(),pool=False));cur=conn.cursor(dictionary=True)
     try:
         cur.execute("SELECT BIN_TO_UUID(submission_id) sub_id, order_id FROM portal_submissions WHERE submission_id=%s", (submission.bytes,))
         existing = cur.fetchone()
@@ -404,6 +476,34 @@ def update_customer_submission(submission_id: str, fields: dict) -> dict | None:
         cur.execute("""SELECT `Order ID`, `Product Name`, `Purchased Product`, `SKU new`, `Name`, `Mobile Number`, `Customer Email`, `Sales Order Owner`
                        FROM `durafit_crm`.`crm_records` WHERE `Order ID` = %s LIMIT 1""", (new_order_id,))
         crm_snap = cur.fetchone()
+
+        sku_val = (fields.get('sku') or (crm_snap['SKU new'] if crm_snap else None) or '').strip() or None
+        product_val = (fields.get('product') or (crm_snap['Purchased Product'] if crm_snap else None) or '').strip() or None
+        so_owner_val = (fields.get('so_owner') or (crm_snap['Sales Order Owner'] if crm_snap else None) or '').strip() or None
+        case_type_val = (fields.get('case_type') or fields.get('issue_category') or '').strip()
+        comment_val = (fields.get('comment') or fields.get('detailed_description') or '').strip()
+
+        case_draft = {
+            "case_id": (fields.get('case_id') or '').strip(),
+            "order_id": new_order_id,
+            "customer": fields['full_name'].strip(),
+            "mobile": fields['phone_number'].strip(),
+            "sku": sku_val or "",
+            "product": product_val or "",
+            "case_type": case_type_val,
+            "status": (fields.get('status') or 'Open').strip(),
+            "spares": (fields.get('spares') or '').strip(),
+            "comment": comment_val,
+            "so_owner": so_owner_val or "",
+            "welcome_call_agent": (fields.get('welcome_call_agent') or '').strip(),
+            "created_by": (fields.get('created_by') or 'Customer Portal').strip(),
+            "created_date": (fields.get('created_date') or datetime.now().strftime("%Y-%m-%d")).strip(),
+            "closed_date": (fields.get('closed_date') or '').strip(),
+            "visit_status": (fields.get('visit_status') or 'Pending').strip(),
+            "amount_charged": (fields.get('amount_charged') or '0').strip(),
+            "amount_to_tech": (fields.get('amount_to_tech') or '0').strip(),
+            "technician_resolution": (fields.get('technician_resolution') or '').strip(),
+        }
 
         cur.execute("""
             UPDATE portal_submissions
@@ -436,35 +536,39 @@ def update_customer_submission(submission_id: str, fields: dict) -> dict | None:
             fields['detailed_description'].strip(),
             crm_snap['Order ID'] if crm_snap else None,
             crm_snap['Product Name'] if crm_snap else None,
-            crm_snap['Purchased Product'] if crm_snap else None,
-            crm_snap['SKU new'] if crm_snap else None,
+            product_val,
+            sku_val,
             crm_snap['Name'] if crm_snap else None,
             crm_snap['Mobile Number'] if crm_snap else None,
             crm_snap['Customer Email'] if crm_snap else None,
-            crm_snap['Sales Order Owner'] if crm_snap else None,
+            so_owner_val,
             submission.bytes,
         ))
         cur.execute("""
             INSERT INTO portal_submission_events (submission_id, case_id, event_type, event_payload, created_at)
             VALUES (%s, NULL, 'submission_edited_by_admin', %s, NOW(6))
-        """, (submission.bytes, json.dumps({"updated_fields": list(fields.keys())})))
+        """, (submission.bytes, json.dumps({"updated_fields": list(fields.keys()), "case_draft": case_draft})))
         conn.commit()
     finally:
         cur.close(); conn.close()
     return customer_case_detail(submission_id)
 
 
-def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> dict | None:
-    """Move a verified customer submission into durafit_cases.case_records and durafit_portal.portal_cases atomically."""
+def move_submission_to_cases(submission_id: str, admin_user: str = "Admin", case_fields: dict | None = None) -> dict | None:
+    """Move a verified customer submission into the cases and active portal databases atomically."""
     try:
         submission = uuid.UUID(submission_id)
     except ValueError:
         return None
 
-    conn = mysql.connector.connect(**mysql_options(database='durafit_portal', pool=False))
+    portal_database = portal_database_name()
+    portal_submissions = _portal_table("portal_submissions")
+    portal_cases = _portal_table("portal_cases")
+    portal_events = _portal_table("portal_submission_events")
+    conn = mysql.connector.connect(**mysql_options(database=portal_database, pool=False))
     cur = conn.cursor(dictionary=True)
     try:
-        cur.execute("""
+        cur.execute(f"""
             SELECT BIN_TO_UUID(submission_id) AS sub_id,
                    order_id,
                    full_name,
@@ -481,7 +585,7 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
                    crm_purchased_product,
                    crm_product_name,
                    crm_sales_order_owner
-            FROM portal_submissions
+            FROM {portal_submissions}
             WHERE submission_id = %s
         """, (submission.bytes,))
         sub = cur.fetchone()
@@ -489,9 +593,9 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
             return None
 
         # Idempotency check: if portal_cases already exists for this submission, return existing case
-        cur.execute("""
+        cur.execute(f"""
             SELECT case_id, case_status, created_at
-            FROM portal_cases
+            FROM {portal_cases}
             WHERE submission_id = %s
         """, (submission.bytes,))
         existing_case = cur.fetchone()
@@ -507,32 +611,85 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
                 "already_moved": True,
             }
 
-        # Case ID format: DF91-CASE-YYYYMMDD-XXXX
-        case_id = f"DF91-CASE-{datetime.now():%Y%m%d}-{uuid.uuid4().hex[:4].upper()}"
-        created_date_str = datetime.now().strftime("%d-%b-%Y")
+        # Read latest saved case_draft from portal_submission_events if present
+        cur.execute(f"""
+            SELECT event_payload
+            FROM {portal_events}
+            WHERE submission_id = %s AND event_type = 'submission_edited_by_admin'
+            ORDER BY created_at DESC LIMIT 1
+        """, (submission.bytes,))
+        ev = cur.fetchone()
+        saved_draft = {}
+        if ev and ev.get("event_payload"):
+            try:
+                raw_p = ev["event_payload"]
+                parsed_p = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
+                saved_draft = parsed_p.get("case_draft") or {}
+            except Exception:
+                saved_draft = {}
+
+        overrides = {**saved_draft, **(case_fields or {})}
+        def _clean(key, fallback=None):
+            val = overrides.get(key)
+            if val is not None and str(val).strip() != "":
+                return str(val).strip()
+            return fallback
+
+        # Case ID format: DF91-CASE-YYYYMMDD-XXXX (or admin-provided Case ID)
+        default_case_id = f"DF91-CASE-{datetime.now():%Y%m%d}-{uuid.uuid4().hex[:4].upper()}"
+        case_id = _clean("case_id", default_case_id)
+        default_created_date = datetime.now().strftime("%d-%b-%Y")
         now_dt = _now()
 
         # Comment mapping: detailed_description, appending address and pincode when present
         comment_parts = []
-        desc = (sub.get("detailed_description") or "").strip()
+        desc = _clean("detailed_description", (sub.get("detailed_description") or "").strip())
         if desc:
             comment_parts.append(desc)
         addr_parts = []
-        if sub.get("customer_address"):
-            addr_parts.append(f"Address: {sub['customer_address'].strip()}")
-        if sub.get("pincode"):
-            addr_parts.append(f"Pincode: {sub['pincode'].strip()}")
+        addr_val = _clean("customer_address", (sub.get("customer_address") or "").strip())
+        pin_val = _clean("pincode", (sub.get("pincode") or "").strip())
+        if addr_val:
+            addr_parts.append(f"Address: {addr_val}")
+        if pin_val:
+            addr_parts.append(f"Pincode: {pin_val}")
         if addr_parts:
             comment_parts.append(", ".join(addr_parts))
-        comment = "\n".join(comment_parts) if comment_parts else None
+        default_comment = "\n".join(comment_parts) if comment_parts else None
 
-        product = (sub.get("crm_purchased_product") or sub.get("crm_product_name") or "").strip() or None
-        sku = (sub.get("crm_sku_new") or "").strip() or None
-        so_owner = (sub.get("crm_sales_order_owner") or "").strip() or None
-        case_type = (sub.get("issue_category") or "Product Issue (Warranty)").strip()
-        created_by = (admin_user or "Customer Portal Verification").strip()
+        order_id_val = _clean("order_id", (sub.get("order_id") or "").strip())
+        customer_val = _clean("full_name", _clean("customer", (sub.get("full_name") or "").strip()))
+        mobile_val = _clean("phone_number", _clean("mobile", (sub.get("phone_number") or "").strip()))
+        default_product = (sub.get("crm_purchased_product") or sub.get("crm_product_name") or "").strip() or None
+        default_sku = (sub.get("crm_sku_new") or "").strip() or None
+        default_so_owner = (sub.get("crm_sales_order_owner") or "").strip() or None
+        default_case_type = _clean("issue_category", (sub.get("issue_category") or "Product Issue (Warranty)").strip())
+        default_created_by = (admin_user or "Customer Portal Verification").strip()
 
-        # Atomic Transaction across durafit_cases and durafit_portal
+        sku = _clean("sku", default_sku)
+        product = _clean("product", default_product)
+        case_type = _clean("case_type", default_case_type)
+        status_val = _clean("status", "Diagnosis")
+        spares_val = _clean("spares", None)
+        comment = _clean("comment", default_comment)
+        so_owner = _clean("so_owner", default_so_owner)
+        welcome_call_agent = _clean("welcome_call_agent", None)
+        created_by = _clean("created_by", default_created_by)
+        created_date_str = _clean("created_date", default_created_date)
+        closed_date_val = _clean("closed_date", None)
+        amount_charged_val = _clean("amount_charged", None)
+        amount_to_tech_val = _clean("amount_to_tech", None)
+        visit_status_val = _clean("visit_status", None)
+        technician_resolution_val = _clean("technician_resolution", None)
+
+        if not order_id_val:
+            raise ValueError("Order ID is required to create a case.")
+        if not customer_val:
+            raise ValueError("Customer name is required to create a case.")
+        if not mobile_val:
+            raise ValueError("Mobile number is required to create a case.")
+
+        # Atomic transaction across the cases and active portal databases.
         conn.start_transaction()
         try:
             # 1. INSERT into durafit_cases.case_records
@@ -544,49 +701,75 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
                     `Amount Charged`, `Amount to Tech`, `Visit Status`, `Technician Resolution`
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                (sub.get("order_id") or "").strip(),
-                (sub.get("full_name") or "").strip(),
-                (sub.get("phone_number") or "").strip(),
+                order_id_val,
+                customer_val,
+                mobile_val,
                 sku,
                 product,
                 case_type,
-                "Created",
-                None,
+                status_val,
+                spares_val,
                 comment,
                 so_owner,
-                None,
+                welcome_call_agent,
                 created_by,
                 created_date_str,
-                None,
-                None,
-                None,
-                None,
-                None,
+                closed_date_val,
+                amount_charged_val,
+                amount_to_tech_val,
+                visit_status_val,
+                technician_resolution_val,
             ))
 
-            # 2. INSERT into durafit_portal.portal_cases
-            cur.execute("""
-                INSERT INTO `durafit_portal`.`portal_cases` (
+            # 2. INSERT into the active portal_cases table.
+            cur.execute(f"""
+                INSERT INTO {portal_cases} (
                     case_id, submission_id, crm_order_id, case_status, created_at, updated_at
                 ) VALUES (%s, %s, %s, 'created', %s, %s)
             """, (
                 case_id,
                 submission.bytes,
-                (sub.get("order_id") or "").strip(),
+                order_id_val,
                 now_dt,
                 now_dt,
             ))
 
-            # 3. UPDATE durafit_portal.portal_submissions
-            cur.execute("""
-                UPDATE `durafit_portal`.`portal_submissions`
-                SET submission_status = 'moved_to_cases', updated_at = %s
+            # 3. UPDATE the active portal_submissions table.
+            cur.execute(f"""
+                UPDATE {portal_submissions}
+                SET order_id = %s,
+                    full_name = %s,
+                    phone_number = %s,
+                    alternate_number = %s,
+                    customer_address = %s,
+                    pincode = %s,
+                    issue_category = %s,
+                    detailed_description = %s,
+                    crm_sku_new = %s,
+                    crm_purchased_product = %s,
+                    crm_sales_order_owner = %s,
+                    submission_status = 'moved_to_cases',
+                    updated_at = %s
                 WHERE submission_id = %s
-            """, (now_dt, submission.bytes))
+            """, (
+                order_id_val,
+                customer_val,
+                mobile_val,
+                _clean("alternate_number", sub.get("alternate_number")),
+                addr_val or sub.get("customer_address") or "",
+                pin_val or sub.get("pincode") or "",
+                default_case_type,
+                desc or sub.get("detailed_description") or "",
+                sku,
+                product,
+                so_owner,
+                now_dt,
+                submission.bytes,
+            ))
 
-            # 4. INSERT into durafit_portal.portal_submission_events
-            cur.execute("""
-                INSERT INTO `durafit_portal`.`portal_submission_events` (
+            # 4. INSERT into the active portal_submission_events table.
+            cur.execute(f"""
+                INSERT INTO {portal_events} (
                     submission_id, case_id, event_type, event_payload, created_at
                 ) VALUES (%s, %s, 'moved_to_cases', %s, %s)
             """, (
@@ -595,7 +778,7 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
                 json.dumps({
                     "case_id": case_id,
                     "moved_by": created_by,
-                    "order_id": sub.get("order_id"),
+                    "order_id": order_id_val,
                 }),
                 now_dt,
             ))
@@ -605,7 +788,7 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
                 "success": True,
                 "case_id": case_id,
                 "submission_id": submission_id,
-                "order_id": sub["order_id"],
+                "order_id": order_id_val,
                 "status": "moved_to_cases",
                 "message": f"Successfully moved to cases. Created Case ID: {case_id}",
                 "already_moved": False,
@@ -621,5 +804,6 @@ def move_submission_to_cases(submission_id: str, admin_user: str = "Admin") -> d
 def move_submission_to_cases_placeholder(submission_id: str) -> dict | None:
     """Retained for backward compatibility; calls move_submission_to_cases."""
     return move_submission_to_cases(submission_id)
+
 
 

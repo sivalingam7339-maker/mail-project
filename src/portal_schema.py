@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mysql.connector
 
-from src.portal_db import mysql_options
+from src.portal_db import mysql_options, portal_database_name
 
 
 SCHEMA = """
@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS `durafit_portal`.`portal_import_history` (
 
 
 def create_schema() -> None:
+    database = portal_database_name()
     options = mysql_options()
     options.pop("database", None)
     options.pop("pool_name", None)
@@ -71,12 +72,13 @@ def create_schema() -> None:
     conn = mysql.connector.connect(**options)
     try:
         cursor = conn.cursor()
-        for statement in (part.strip() for part in SCHEMA.split(";") if part.strip()):
+        schema = SCHEMA.replace("`durafit_portal`", f"`{database}`")
+        for statement in (part.strip() for part in schema.split(";") if part.strip()):
             cursor.execute(statement)
-        cursor.execute("ALTER TABLE `durafit_portal`.`portal_submissions` MODIFY COLUMN `state` VARCHAR(128) NULL")
-        cursor.execute("ALTER TABLE `durafit_portal`.`portal_submissions` MODIFY COLUMN `subject` VARCHAR(255) NULL")
-        cursor.execute("ALTER TABLE `durafit_portal`.`portal_submissions` MODIFY COLUMN `crm_order_id` VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL")
-        cursor.execute("ALTER TABLE `durafit_portal`.`portal_cases` MODIFY COLUMN `crm_order_id` VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL")
+        cursor.execute(f"ALTER TABLE `{database}`.`portal_submissions` MODIFY COLUMN `state` VARCHAR(128) NULL")
+        cursor.execute(f"ALTER TABLE `{database}`.`portal_submissions` MODIFY COLUMN `subject` VARCHAR(255) NULL")
+        cursor.execute(f"ALTER TABLE `{database}`.`portal_submissions` MODIFY COLUMN `crm_order_id` VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL")
+        cursor.execute(f"ALTER TABLE `{database}`.`portal_cases` MODIFY COLUMN `crm_order_id` VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL")
         conn.commit()
     finally:
         conn.close()

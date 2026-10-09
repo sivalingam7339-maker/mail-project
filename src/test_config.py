@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from config import REQUIRED_KEYS, load_config
+from portal_db import mysql_options, portal_database_name, source_database_name, validate_test_mysql_host
 
 
 def fake_env_text() -> str:
@@ -13,6 +14,27 @@ def fake_env_text() -> str:
 
 
 def main() -> int:
+    # These assertions exercise only pure validation; no database connection is opened.
+    validate_test_mysql_host("127.0.0.1")
+    try:
+        validate_test_mysql_host("example.aivencloud.com")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Aiven host was not rejected before database access")
+    test_db_options = mysql_options(pool=False)
+    assert (
+        test_db_options["host"] == "127.0.0.1"
+        and test_db_options["port"] == 3306
+        and test_db_options["database"] == "durafit_portal_test"
+    )
+    assert portal_database_name() == "durafit_portal_test"
+    try:
+        source_database_name("crm")
+    except RuntimeError as error:
+        assert "fixture database" in str(error)
+    else:
+        raise AssertionError("Unconfigured test CRM source fixture was not guarded")
     with tempfile.TemporaryDirectory() as directory:
         env_path = Path(directory) / ".env"
         env_path.write_text(fake_env_text(), encoding="utf-8")
@@ -33,7 +55,7 @@ def main() -> int:
             raise AssertionError("Missing configuration did not raise a clear error")
     gitignore = (Path(__file__).resolve().parent.parent / ".gitignore").read_text(encoding="utf-8")
     assert ".env" in gitignore and ".env.*" in gitignore and REQUIRED_KEYS
-    print("Configuration self-test passed: TEST default, required values, missing-value error, and .env ignore rules.")
+    print("Configuration self-test passed: local MySQL accepted, Aiven rejected before access, and config checks passed.")
     return 0
 
 

@@ -13,7 +13,8 @@ import uuid
 import mysql.connector
 from fastapi import HTTPException, UploadFile
 
-from src.portal_db import mysql_options
+from src.portal_db import mysql_options, portal_database_name
+from src.portal_email import send_submission_acknowledgement
 
 
 STORAGE_ROOT = Path(r"C:\Mail\storage\portal-submissions")
@@ -101,15 +102,26 @@ async def create_submission(fields: dict[str, str], invoice_image: UploadFile | 
     if len(attachments) > MAX_ATTACHMENTS:
         raise HTTPException(status_code=422, detail="A maximum of five attachments is allowed")
     order_id = fields["order_id"].strip()
-    options = mysql_options(database="durafit_portal")
+    options = mysql_options(database=portal_database_name(), pool=False)
     conn = mysql.connector.connect(**options)
     directory: Path | None = None
+    committed_submission_id: str | None = None
+    recipient_email: str | None = None
     try:
         cursor = conn.cursor(dictionary=True)
         existing = _existing(cursor, idempotency_key)
         if existing:
             return {**existing, "replayed": True}
         snapshot = _crm_snapshot(cursor, order_id)
+        submitted_email = (
+            fields.get("email")
+            or fields.get("email_address")
+            or fields.get("customer_email")
+            or ""
+        ).strip()
+        crm_email = (snapshot["Customer Email"] if snapshot and snapshot.get("Customer Email") else "").strip()
+        recipient_email = submitted_email or crm_email or None
+
         submission_uuid = uuid.uuid4()
         submission_id = _uuid_bytes(submission_uuid)
         directory = STORAGE_ROOT / str(submission_uuid)
@@ -122,13 +134,13 @@ async def create_submission(fields: dict[str, str], invoice_image: UploadFile | 
         conn.start_transaction()
         cursor.execute("""INSERT INTO portal_submissions
           (submission_id,idempotency_key,crm_order_id,crm_product_name,crm_purchased_product,crm_sku_new,crm_customer_name,crm_mobile_number,crm_customer_email,crm_sales_order_owner,full_name,email_address,phone_number,alternate_number,order_id,customer_address,state,pincode,issue_category,subject,detailed_description,submission_status,created_at,updated_at)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending_verification',%s,%s)""",
-          (submission_id,idempotency_key,snapshot["Order ID"] if snapshot else None,snapshot["Product Name"] if snapshot else None,snapshot["Purchased Product"] if snapshot else None,snapshot["SKU new"] if snapshot else None,snapshot["Name"] if snapshot else None,snapshot["Mobile Number"] if snapshot else None,snapshot["Customer Email"] if snapshot else None,snapshot["Sales Order Owner"] if snapshot else None,fields["full_name"],fields["phone"],fields.get("alternate_number") or None,order_id,fields["customer_address"],fields.get("state"),fields["pincode"],fields["issue_category"],fields.get("subject"),fields["description"],now,now))
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending_verification',%s,%s)""",
+          (submission_id,idempotency_key,snapshot["Order ID"] if snapshot else None,snapshot["Product Name"] if snapshot else None,snapshot["Purchased Product"] if snapshot else None,snapshot["SKU new"] if snapshot else None,snapshot["Name"] if snapshot else None,snapshot["Mobile Number"] if snapshot else None,snapshot["Customer Email"] if snapshot else None,snapshot["Sales Order Owner"] if snapshot else None,fields["full_name"],recipient_email,fields["phone"],fields.get("alternate_number") or None,order_id,fields["customer_address"],fields.get("state"),fields["pincode"],fields["issue_category"],fields.get("subject"),fields["description"],now,now))
         cursor.executemany("""INSERT INTO portal_submission_attachments (attachment_id,submission_id,attachment_kind,display_order,storage_key,original_filename,content_type,byte_size,sha256,upload_status,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'stored',%s)""", [(item["attachment_id"],submission_id,item["kind"],item["display_order"],item["storage_key"],item["filename"],item["content_type"],item["size"],item["sha256"],now) for item in stored])
         cursor.execute("INSERT INTO portal_submission_events (submission_id,case_id,event_type,event_payload,created_at) VALUES (%s,NULL,'submission_created',%s,%s)", (submission_id,json.dumps({"attachment_count": len(stored)}),now))
         cursor.execute("INSERT INTO portal_email_outbox (outbox_id,submission_id,message_type,delivery_status) VALUES (%s,%s,'customer_confirmation','pending')", (_uuid_bytes(uuid.uuid4()),submission_id))
         conn.commit()
-        return {"submission_id": str(submission_uuid), "case_id": None, "status": "pending_verification", "replayed": False}
+        committed_submission_id = str(submission_uuid)
     except mysql.connector.IntegrityError:
         conn.rollback()
         cursor = conn.cursor(dictionary=True)
@@ -143,3 +155,22 @@ async def create_submission(fields: dict[str, str], invoice_image: UploadFile | 
         raise
     finally:
         conn.close()
+
+    # ONLY AFTER the database transaction commits successfully, send the acknowledgement email.
+    if committed_submission_id:
+        try:
+            send_submission_acknowledgement(
+                submission_id=committed_submission_id,
+                customer_name=fields["full_name"],
+                recipient_email=recipient_email,
+            )
+        except Exception:
+            # Never fail a committed customer submission if SMTP experiences a transient issue
+            pass
+
+    return {
+        "submission_id": committed_submission_id,
+        "case_id": None,
+        "status": "pending_verification",
+        "replayed": False,
+    }
